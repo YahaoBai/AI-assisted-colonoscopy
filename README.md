@@ -16,14 +16,14 @@
 * `control/`：存放底层控制算法，包括积分分离模糊 PID、C++ 串口通讯接收器 (`receiver.cpp`) 以及模仿学习 (`il.py`)。
 * `perception/`：存放视觉感知模块，包含 Attention U-Net 网络架构、特征提取骨干网以及图像处理 API。
 
-## 4. 核心控制逻辑 (Core Control Logic)
+## 3. 核心控制逻辑 (Core Control Logic)
 
 当前的自动驾驶混合控制状态机集成了动态降速与弯道检测机制。高曲率弯道的判定条件已精确固化为以下多维逻辑门：
 * **条件 A：** 归一化中心误差 (`error`) > `0.08` 且 (俯仰角 `pitch` > `0.5` 或 偏航角 `yaw` > `0.5`)
 * **条件 B：** 俯仰角速度 (`pitch angular velocity`) > `1.5`
 * *(满足任意条件即触发减速与姿态修正策略)*
 
-## 5. Git 协作规范 (Collaboration Workflow)
+## 4. Git 协作规范 (Collaboration Workflow)
 
 本项目的 `main` 分支为受保护的主干分支，仅存储经过验证的稳定代码。
 
