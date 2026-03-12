@@ -1,0 +1,17 @@
+# 忽略模型权重文件
+checkpoints/
+*.pth
+*.pt
+
+# 忽略 Python 运行时缓存
+__pycache__/
+*.pyc
+*/__pycache__/
+*/*/__pycache__/
+
+# 忽略可能采集的本地数据集
+dataset/
+masks/
+
+# 忽略 C++ 编译生成的可执行文件
+control/receiver
