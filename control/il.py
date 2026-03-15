@@ -91,10 +91,10 @@ listener.start()
 # ==========================================
 try:
     # 优先加载当前目录 assets 下的 XML
-    xml_path = './assets/xml/colon_scene2.xml'
+    xml_path = './assets/xml/colon_scene.xml'
     if not os.path.exists(xml_path):
         # 备选路径
-        xml_path = '../xml/colon_scene2.xml'
+        xml_path = '../xml/colon_scene.xml'
     
     model = mujoco.MjModel.from_xml_path(xml_path)
     data = mujoco.MjData(model)
