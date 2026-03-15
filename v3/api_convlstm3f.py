@@ -18,7 +18,7 @@ def predict(img_stack: np.ndarray) -> np.ndarray:
         action: [delta_yaw, delta_pitch], shape=(2,), unit=rad.
     """
     if not hasattr(predict, '_initialized'):
-        model_path = os.environ.get('IL_V3_MODEL_PATH', './v3/checkpoints/convlstm3f_best.pth')
+        model_path = os.environ.get('IL_V3_MODEL_PATH', './checkpoints/convlstm3f_best.pth')
         device_name = os.environ.get('IL_V3_DEVICE', 'auto')
 
         if device_name == 'auto':
