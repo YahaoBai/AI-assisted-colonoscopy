@@ -15,7 +15,7 @@ import serial  # [新增] 导入串口通信库
 # 1. 导入推理接口
 # ==========================================
 try:
-    from lumen_center_api import init, get_lumen_center
+    from perception.lumen_center_api import init, get_lumen_center
     print(">>> 正在加载 Attention U-Net 模型权重...")
     init('./checkpoints/attention_best_model.pth')
     print(">>> 模型初始化成功。")
