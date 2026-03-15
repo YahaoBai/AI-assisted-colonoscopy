@@ -5,7 +5,7 @@ Colonoscopy Navigation API - 极速推理接口 (I/O与算子优化版)
 import numpy as np
 import torch
 
-MODEL_PATH = './checkpoints/colonoscopy_net_best.pth'
+MODEL_PATH = './checkpoints/dagger_v1.pth'
 DEVICE = 'auto'
 
 _model = None
