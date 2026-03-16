@@ -1,6 +1,6 @@
 # AI-Assisted Colonoscopy Robot Navigation System
 
-**Harbin Institute of Technology (Weihai)** | **Measurement & Control Technology and Instruments**
+**Harbin Institute of Technology (Weihai)** | 
 
 
 ## 1. 工程概述 (Project Overview)
