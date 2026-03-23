@@ -5,6 +5,7 @@
 #include <unistd.h>   // UNIX 标准函数定义
 #include <termios.h>  // POSIX 终端控制定义
 #include <string>
+#include <cstdio>
 
 // 1. 初始化底层串口通信
 int init_serial_port(const char* port_name) {
@@ -50,6 +51,7 @@ int main() {
 
     std::string buffer = "";
     char read_buf[256];
+    bool estop_latched = false;
 
     // 2. 机器人实时控制主循环
     while (true) {
@@ -67,12 +69,50 @@ int main() {
                 std::string frame = buffer.substr(0, pos);
                 buffer.erase(0, pos + 1);
 
-                // 解析 Yaw 和 Pitch
-                float d_yaw = 0.0f, d_pitch = 0.0f;
-                if (sscanf(frame.c_str(), "%f,%f", &d_yaw, &d_pitch) == 2) {
-                    std::cout << "[硬件层执行] Yaw速度: " << d_yaw 
-                              << " | Pitch速度: " << d_pitch << std::endl;
+                if (!frame.empty() && frame.back() == '\r') {
+                    frame.pop_back();
                 }
+                if (frame.empty()) {
+                    continue;
+                }
+
+                if (frame.rfind("ESTOP", 0) == 0) {
+                    std::string reason = "UNKNOWN";
+                    size_t comma = frame.find(',');
+                    if (comma != std::string::npos && comma + 1 < frame.size()) {
+                        reason = frame.substr(comma + 1);
+                    }
+                    estop_latched = true;
+                    std::cout << "[硬件层急停] ESTOP 已锁存, reason=" << reason << std::endl;
+                    continue;
+                }
+
+                if (frame == "RESET") {
+                    estop_latched = false;
+                    std::cout << "[硬件层复位] 急停锁存已清除, 可恢复执行 CMD" << std::endl;
+                    continue;
+                }
+
+                if (frame.rfind("CMD,", 0) == 0) {
+                    if (estop_latched) {
+                        std::cout << "[硬件层丢弃] ESTOP 锁存中, 忽略指令: " << frame << std::endl;
+                        continue;
+                    }
+
+                    float m1 = 0.0f, m2 = 0.0f, m3 = 0.0f, m4 = 0.0f;
+                    if (sscanf(frame.c_str(), "CMD,%f,%f,%f,%f", &m1, &m2, &m3, &m4) == 4) {
+                        std::cout << "[硬件层执行] MotorTarget(mm): "
+                                  << "m1=" << m1 << ", "
+                                  << "m2=" << m2 << ", "
+                                  << "m3=" << m3 << ", "
+                                  << "m4=" << m4 << std::endl;
+                    } else {
+                        std::cout << "[硬件层告警] CMD 解析失败: " << frame << std::endl;
+                    }
+                    continue;
+                }
+
+                std::cout << "[硬件层告警] 未知帧类型: " << frame << std::endl;
             }
         }
         // 模拟机器人底层 1000Hz 的控制周期，防止 while 循环占满单个 CPU 核心

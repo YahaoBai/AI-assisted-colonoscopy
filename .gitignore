@@ -17,3 +17,6 @@ masks/
 control/receiver
 .vscode/
 eval_reports/
+sim2real_motor_log.csv
+sim2real_motor_plot.png
+

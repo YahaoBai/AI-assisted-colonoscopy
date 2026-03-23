@@ -9,6 +9,11 @@ import cv2
 import math
 from collections import deque
 
+try:
+    import serial
+except ImportError:
+    serial = None
+
 # ==========================================
 # 1. 导入感知模块 (Attention U-Net) 与 决策模块 (Policy)
 # ==========================================
@@ -28,6 +33,14 @@ except ImportError as e:
     print(f"⚠️ 致命错误: 无法导入 Policy ({e})。请检查 api.py")
     exit()
 
+from control.sim2real_bridge import (
+    BridgeCommand,
+    DaggerSim2RealRuntimeConfig,
+    Sim2RealBridge,
+    default_dagger_sim2real_runtime_config,
+    load_dagger_sim2real_runtime_config,
+)
+
 # ==========================================
 # 2. 全局配置与状态机
 # ==========================================
@@ -43,10 +56,16 @@ MANUAL_MOVE_SPEED = 0.6
 MANUAL_ROTATE_SPEED = 1.8
 ZOOM_SPEED = 10.0
 
+SIM2REAL_CONFIG_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "sim2real_config.yaml",
+)
+
 key_states = {
     'forward': False, 'pitch_up': False, 'pitch_down': False,
     'yaw_left': False, 'yaw_right': False, 'zoom_in': False, 'zoom_out': False,
-    'autopilot_toggle_pressed': False, 'autopilot_on': False
+    'autopilot_toggle_pressed': False, 'autopilot_on': False,
+    'reset_estop_pressed': False,
 }
 
 def on_press(key):
@@ -55,6 +74,9 @@ def on_press(key):
             if key.char == '1': key_states['forward'] = True
             elif key.char == '+': key_states['zoom_in'] = True
             elif key.char == '-': key_states['zoom_out'] = True
+            elif key.char in ('r', 'R'):
+                if not key_states['reset_estop_pressed']:
+                    key_states['reset_estop_pressed'] = True
             elif key.char == '5':
                 if not key_states['autopilot_toggle_pressed']:
                     key_states['autopilot_toggle_pressed'] = True
@@ -74,6 +96,7 @@ def on_release(key):
             if key.char == '1': key_states['forward'] = False
             elif key.char == '+': key_states['zoom_in'] = False
             elif key.char == '-': key_states['zoom_out'] = False
+            elif key.char in ('r', 'R'): key_states['reset_estop_pressed'] = False
             elif key.char == '5': key_states['autopilot_toggle_pressed'] = False
         except AttributeError: pass
     else:
@@ -112,6 +135,176 @@ except Exception as e:
     listener.stop()
     exit()
 
+# Sim2Real 配置加载（YAML）
+try:
+    runtime_cfg: DaggerSim2RealRuntimeConfig = load_dagger_sim2real_runtime_config(
+        SIM2REAL_CONFIG_PATH
+    )
+    print(f">>> Sim2Real YAML 配置加载成功: {SIM2REAL_CONFIG_PATH}")
+except Exception as e:
+    print(f"⚠️ Sim2Real YAML 配置加载失败: {e}")
+    print("⚠️ 将回退到内置默认配置，请尽快修复 YAML 文件。")
+    runtime_cfg = default_dagger_sim2real_runtime_config()
+
+sim2real_cfg = runtime_cfg.bridge
+estop_alarm_cfg = runtime_cfg.alarm
+motor_output_cfg = runtime_cfg.output
+sim2real_bridge = Sim2RealBridge(sim2real_cfg)
+
+serial_link = None
+if serial is None:
+    print("⚠️ 未安装 pyserial，Sim2Real 指令将仅打印，不会下发到底层串口。")
+else:
+    try:
+        serial_link = serial.Serial(
+            sim2real_cfg.serial_port,
+            baudrate=sim2real_cfg.serial_baudrate,
+            timeout=sim2real_cfg.serial_timeout,
+        )
+        print(f">>> Sim2Real 串口链路已挂载: {sim2real_cfg.serial_port}")
+    except Exception as e:
+        print(f"⚠️ Sim2Real 串口挂载失败: {e}，将切换为仅打印模式。")
+        serial_link = None
+
+
+def send_serial_frame(frame: str) -> None:
+    if serial_link is not None:
+        try:
+            serial_link.write(frame.encode("utf-8"))
+        except Exception as e:
+            print(f"⚠️ 串口发送失败: {e} | frame={frame.strip()}")
+            return
+    if motor_output_cfg.print_tx_frame:
+        print(f"[Sim2Real TX] {frame.strip()}")
+
+
+def emit_estop_alarm(frame_idx: int, reason: str, yaw_rad: float, pitch_rad: float) -> None:
+    if not estop_alarm_cfg.enabled:
+        return
+
+    border = "!" * estop_alarm_cfg.banner_width
+    bell = "\a" if estop_alarm_cfg.terminal_bell else ""
+    alert_msg = (
+        f"[ALARM][FRAME {frame_idx}] SIM2REAL ESTOP LATCHED | reason={reason} | "
+        f"yaw={np.rad2deg(yaw_rad):.2f}deg | pitch={np.rad2deg(pitch_rad):.2f}deg | PRESS [R] TO RESET"
+    )
+
+    for _ in range(estop_alarm_cfg.repeat):
+        print(f"{bell}{border}")
+        print(alert_msg)
+        print(border)
+
+
+motor_frame_log = []
+motor_target_log = []
+
+
+def record_motor_target(frame_idx: int, motor_target_mm: np.ndarray) -> None:
+    motor_frame_log.append(int(frame_idx))
+    motor_target_log.append(np.asarray(motor_target_mm, dtype=np.float64).copy())
+
+    if motor_output_cfg.print_every_n > 0:
+        record_count = len(motor_target_log)
+        if record_count % motor_output_cfg.print_every_n == 0:
+            last = motor_target_log[-1]
+            print(
+                f"[MotorLog] 已记录 {record_count} 条电机目标位移 | "
+                f"最新: m1={last[0]:.4f}, m2={last[1]:.4f}, m3={last[2]:.4f}, m4={last[3]:.4f} (mm)"
+            )
+
+
+def save_motor_outputs() -> None:
+    if len(motor_target_log) == 0:
+        print(">>> [MotorLog] 本次无可导出的电机目标位移记录。")
+        return
+
+    frames = np.asarray(motor_frame_log, dtype=np.int64)
+    motors = np.asarray(motor_target_log, dtype=np.float64)
+
+    if motor_output_cfg.save_csv:
+        csv_path = motor_output_cfg.csv_path
+        csv_dir = os.path.dirname(csv_path)
+        if csv_dir:
+            os.makedirs(csv_dir, exist_ok=True)
+        csv_data = np.column_stack([frames, motors])
+        np.savetxt(
+            csv_path,
+            csv_data,
+            delimiter=",",
+            header="frame,m1_target_mm,m2_target_mm,m3_target_mm,m4_target_mm",
+            comments="",
+            fmt=["%d", "%.8f", "%.8f", "%.8f", "%.8f"],
+        )
+        print(f">>> [MotorLog] 电机目标位移 CSV 已保存: {csv_path}")
+
+    if motor_output_cfg.save_plot:
+        try:
+            import matplotlib
+            import matplotlib.pyplot as plt
+            from matplotlib import font_manager
+        except ImportError:
+            print("⚠️ [MotorLog] 未安装 matplotlib，跳过位移曲线图导出。")
+            return
+
+        # 优先尝试中文字体；若系统无可用中文字体则自动回退英文文案，避免乱码。
+        cjk_font_candidates = [
+            "Noto Sans CJK SC",
+            "Noto Sans SC",
+            "Microsoft YaHei",
+            "SimHei",
+            "PingFang SC",
+            "WenQuanYi Zen Hei",
+            "Source Han Sans SC",
+            "Arial Unicode MS",
+        ]
+        available_font_names = {f.name for f in font_manager.fontManager.ttflist}
+        chosen_cjk_font = next((name for name in cjk_font_candidates if name in available_font_names), None)
+        if chosen_cjk_font is not None:
+            matplotlib.rcParams["font.sans-serif"] = [
+                chosen_cjk_font,
+                *matplotlib.rcParams.get("font.sans-serif", []),
+            ]
+        matplotlib.rcParams["axes.unicode_minus"] = False
+
+        if len(frames) > motor_output_cfg.max_plot_points:
+            pick_idx = np.linspace(
+                0,
+                len(frames) - 1,
+                num=motor_output_cfg.max_plot_points,
+                dtype=np.int64,
+            )
+            frames_plot = frames[pick_idx]
+            motors_plot = motors[pick_idx]
+        else:
+            frames_plot = frames
+            motors_plot = motors
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(frames_plot, motors_plot[:, 0], label="m1")
+        ax.plot(frames_plot, motors_plot[:, 1], label="m2")
+        ax.plot(frames_plot, motors_plot[:, 2], label="m3")
+        ax.plot(frames_plot, motors_plot[:, 3], label="m4")
+        if chosen_cjk_font is not None:
+            ax.set_xlabel("帧号")
+            ax.set_ylabel("电机绝对位移目标 (mm)")
+            ax.set_title("电机绝对位移目标轨迹")
+        else:
+            ax.set_xlabel("Frame")
+            ax.set_ylabel("Motor Absolute Target (mm)")
+            ax.set_title("Motor Absolute Target Trajectory")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="best")
+        fig.tight_layout()
+
+        plot_path = motor_output_cfg.plot_path
+        plot_dir = os.path.dirname(plot_path)
+        if plot_dir:
+            os.makedirs(plot_dir, exist_ok=True)
+        fig.savefig(plot_path, dpi=motor_output_cfg.plot_dpi)
+        plt.close(fig)
+        print(f">>> [MotorLog] 电机目标位移曲线图已保存: {plot_path}")
+
+
 frame_buffer = deque(maxlen=3)
 
 FILTER_WINDOW = 5
@@ -123,6 +316,7 @@ speed_trigger_counter = 0
 speed_recovery_counter = 0    
 TRIGGER_FRAMES = 5            
 RECOVERY_FRAMES = 30 
+frame_count = 0
 
 # [极速优化 1] 废除耗时的 max() 扫描，直接就地内存乘法
 def process_mask_for_policy(raw_mask):
@@ -135,6 +329,7 @@ def process_mask_for_policy(raw_mask):
 
 print("\n" + "="*60)
 print("     结肠镜仿真系统 ")
+print("  [5] 自动模式开关 | [R] 清除角度锁存急停")
 print("="*60 + "\n")
 
 try:
@@ -152,6 +347,17 @@ try:
         while viewer.is_running():
             step_start = time.time()
             dt = model.opt.timestep
+
+            if key_states['reset_estop_pressed']:
+                key_states['reset_estop_pressed'] = False
+                sim2real_bridge.reset()
+                for frame in sim2real_bridge.get_reset_frames():
+                    send_serial_frame(frame)
+                print(">>> [Sim2Real] 已清除急停锁存，累计角归零并下发零位。")
+
+            if sim2real_bridge.estop_latched and key_states['autopilot_on']:
+                key_states['autopilot_on'] = False
+                print(">>> [Sim2Real] 角度急停已锁存，自动模式被禁止。请按 [R] 复位。")
 
             step_pitch = 0.0
             step_yaw = 0.0
@@ -200,33 +406,60 @@ try:
                     latency_ms = (pipeline_end - pipeline_start) * 1000
                     # 恢复普通逐行打印，方便后台挂机与日志记录
                     #print(f">>> [实时延迟] U-Net感知 -> Policy决策: {latency_ms:.2f} ms")
-                    
-                    # [状态机]: 动态降速逻辑与冷却保护
-                    base_auto_speed = MANUAL_MOVE_SPEED * 0.85
-                    
-                    if total_norm_error > 0.18:
-                        speed_trigger_counter += 1
-                    else:
-                        speed_trigger_counter = 0
 
-                    if speed_trigger_counter >= TRIGGER_FRAMES:
-                        current_speed = base_auto_speed * 0.4
-                        speed_recovery_counter = RECOVERY_FRAMES  
-                        if not is_slowing_down:
-                            # 移除开头的 \n，使日志输出紧凑整齐
-                            print(f">>> [限速触发] 连续 {TRIGGER_FRAMES} 帧确认高曲率 | 推进速度降至: {current_speed:.3f}")
-                            is_slowing_down = True
+                    bridge_result = sim2real_bridge.step(step_yaw, step_pitch, dt)
+                    if bridge_result.should_send and bridge_result.serial_frame:
+                        send_serial_frame(bridge_result.serial_frame)
+
+                    if bridge_result.command == BridgeCommand.ESTOP:
+                        key_states['autopilot_on'] = False
+                        is_slowing_down = False
+                        speed_trigger_counter = 0
+                        speed_recovery_counter = 0
+                        step_yaw = 0.0
+                        step_pitch = 0.0
+                        local_displacement[2] = 0.0
+                        emit_estop_alarm(
+                            frame_idx=frame_count,
+                            reason=bridge_result.reason or "ANGLE_LIMIT",
+                            yaw_rad=bridge_result.yaw_accum_rad,
+                            pitch_rad=bridge_result.pitch_accum_rad,
+                        )
+                        print(
+                            f"[{frame_count}] 🛑 [Sim2Real] 角度越界触发急停锁存 | "
+                            f"yaw={np.rad2deg(bridge_result.yaw_accum_rad):.2f}° "
+                            f"pitch={np.rad2deg(bridge_result.pitch_accum_rad):.2f}° | 按 [R] 复位"
+                        )
                     else:
-                        if speed_recovery_counter > 0:
-                            speed_recovery_counter -= 1
-                            current_speed = base_auto_speed * 0.4  
+                        if bridge_result.should_send:
+                            record_motor_target(frame_count, bridge_result.motor_target_mm)
+
+                        # [状态机]: 动态降速逻辑与冷却保护
+                        base_auto_speed = MANUAL_MOVE_SPEED * 0.85
+
+                        if total_norm_error > 0.18:
+                            speed_trigger_counter += 1
                         else:
-                            current_speed = base_auto_speed
-                            if is_slowing_down:
-                                print(f">>> [限速解除] 误差回落且冷却期结束 | 推进速度恢复: {current_speed:.3f}")
-                                is_slowing_down = False
-                                
-                    local_displacement[2] -= current_speed * dt
+                            speed_trigger_counter = 0
+
+                        if speed_trigger_counter >= TRIGGER_FRAMES:
+                            current_speed = base_auto_speed * 0.4
+                            speed_recovery_counter = RECOVERY_FRAMES  
+                            if not is_slowing_down:
+                                # 移除开头的 \n，使日志输出紧凑整齐
+                                print(f">>> [限速触发] 连续 {TRIGGER_FRAMES} 帧确认高曲率 | 推进速度降至: {current_speed:.3f}")
+                                is_slowing_down = True
+                        else:
+                            if speed_recovery_counter > 0:
+                                speed_recovery_counter -= 1
+                                current_speed = base_auto_speed * 0.4  
+                            else:
+                                current_speed = base_auto_speed
+                                if is_slowing_down:
+                                    print(f">>> [限速解除] 误差回落且冷却期结束 | 推进速度恢复: {current_speed:.3f}")
+                                    is_slowing_down = False
+                                    
+                        local_displacement[2] -= current_speed * dt
                 else:
                     if is_slowing_down:
                         is_slowing_down = False
@@ -271,9 +504,13 @@ try:
 
             mujoco.mj_step(model, data)
             viewer.sync()
+            frame_count += 1
             
             time.sleep(max(0, dt - (time.time() - step_start)))
 
 finally:
     listener.stop()
+    if serial_link is not None:
+        serial_link.close()
+    save_motor_outputs()
     print("程序结束。")
