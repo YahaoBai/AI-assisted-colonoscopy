@@ -18,6 +18,8 @@ DEFAULT_J_4X2_MM_PER_RAD = np.array(
     dtype=np.float64,
 )
 
+MOTOR_NAME_SET = ("m1", "m2", "m3", "m4")
+
 
 class BridgeCommand(str, Enum):
     CMD = "CMD"
@@ -35,6 +37,8 @@ class Sim2RealConfig:
     serial_port: str = "/dev/pts/3"
     serial_baudrate: int = 115200
     serial_timeout: float = 0.0
+    serial_critical_retry_count: int = 3
+    serial_critical_retry_interval_sec: float = 0.02
 
     def __post_init__(self) -> None:
         self.J_4x2_mm_per_rad = np.asarray(self.J_4x2_mm_per_rad, dtype=np.float64)
@@ -42,12 +46,20 @@ class Sim2RealConfig:
             raise ValueError(
                 f"J_4x2_mm_per_rad must have shape (4, 2), got {self.J_4x2_mm_per_rad.shape}"
             )
-        if len(self.motor_order) != 4:
-            raise ValueError(f"motor_order must contain 4 entries, got {len(self.motor_order)}")
+        motor_order_tuple = tuple(str(x).strip() for x in self.motor_order)
+        if len(motor_order_tuple) != 4:
+            raise ValueError(f"motor_order must contain 4 entries, got {len(motor_order_tuple)}")
+        if set(motor_order_tuple) != set(MOTOR_NAME_SET):
+            raise ValueError("motor_order must be a permutation of ('m1','m2','m3','m4').")
+        self.motor_order = motor_order_tuple
         if float(self.motor_limit_mm) <= 0.0:
             raise ValueError("motor_limit_mm must be > 0")
         if float(self.control_hz) <= 0.0:
             raise ValueError("control_hz must be > 0")
+        self.serial_critical_retry_count = max(1, int(self.serial_critical_retry_count))
+        self.serial_critical_retry_interval_sec = float(self.serial_critical_retry_interval_sec)
+        if self.serial_critical_retry_interval_sec < 0.0:
+            raise ValueError("serial_critical_retry_interval_sec must be >= 0")
 
 
 @dataclass
@@ -111,6 +123,10 @@ class Sim2RealBridge:
         self.motor_target_mm = np.zeros(4, dtype=np.float64)
         self.control_dt_accum = 0.0
         self.estop_latched = False
+        self.cmd_send_indices = tuple(MOTOR_NAME_SET.index(name) for name in self.config.motor_order)
+
+    def _motor_target_for_cmd_order(self, motor_target_mm: np.ndarray) -> np.ndarray:
+        return np.asarray(motor_target_mm, dtype=np.float64)[list(self.cmd_send_indices)]
 
     def _make_estop(self, reason: str) -> BridgeResult:
         return BridgeResult(
@@ -163,7 +179,11 @@ class Sim2RealBridge:
                 should_send = True
                 self.control_dt_accum = math.fmod(self.control_dt_accum, self.control_period_sec)
 
-        cmd_frame = self.build_cmd_frame(self.motor_target_mm.tolist()) if should_send else ""
+        cmd_frame = (
+            self.build_cmd_frame(self._motor_target_for_cmd_order(self.motor_target_mm).tolist())
+            if should_send
+            else ""
+        )
 
         return BridgeResult(
             command=BridgeCommand.CMD,
@@ -183,9 +203,10 @@ class Sim2RealBridge:
         self.estop_latched = False
 
     def get_reset_frames(self) -> Tuple[str, str]:
+        zero_target_cmd_order = self._motor_target_for_cmd_order(np.zeros(4, dtype=np.float64))
         return (
             self.build_reset_frame(),
-            self.build_cmd_frame([0.0, 0.0, 0.0, 0.0]),
+            self.build_cmd_frame(zero_target_cmd_order.tolist()),
         )
 
     @staticmethod
@@ -219,6 +240,8 @@ def default_dagger_sim2real_runtime_config() -> DaggerSim2RealRuntimeConfig:
         serial_port="/dev/pts/3",
         serial_baudrate=115200,
         serial_timeout=0.0,
+        serial_critical_retry_count=3,
+        serial_critical_retry_interval_sec=0.02,
     )
     alarm_cfg = EstopAlarmConfig(
         enabled=True,
@@ -282,10 +305,12 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
 
     motor_order_raw = sim2real_raw.get("motor_order", defaults.bridge.motor_order)
     if isinstance(motor_order_raw, str):
-        raise ValueError("`sim2real.motor_order` must be a list of 4 motor names.")
-    motor_order = tuple(str(x) for x in motor_order_raw)
+        raise ValueError("`sim2real.motor_order` must be a list containing m1,m2,m3,m4 in some order.")
+    motor_order = tuple(str(x).strip() for x in motor_order_raw)
     if len(motor_order) != 4:
         raise ValueError(f"`sim2real.motor_order` must have 4 entries, got {len(motor_order)}")
+    if set(motor_order) != set(MOTOR_NAME_SET):
+        raise ValueError("`sim2real.motor_order` must be a permutation of ['m1','m2','m3','m4']")
 
     bridge_cfg = Sim2RealConfig(
         J_4x2_mm_per_rad=_coerce_matrix(
@@ -299,6 +324,15 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
         serial_port=str(serial_raw.get("port", defaults.bridge.serial_port)),
         serial_baudrate=int(serial_raw.get("baudrate", defaults.bridge.serial_baudrate)),
         serial_timeout=float(serial_raw.get("timeout", defaults.bridge.serial_timeout)),
+        serial_critical_retry_count=int(
+            serial_raw.get("critical_retry_count", defaults.bridge.serial_critical_retry_count)
+        ),
+        serial_critical_retry_interval_sec=float(
+            serial_raw.get(
+                "critical_retry_interval_sec",
+                defaults.bridge.serial_critical_retry_interval_sec,
+            )
+        ),
     )
 
     alarm_cfg = EstopAlarmConfig(

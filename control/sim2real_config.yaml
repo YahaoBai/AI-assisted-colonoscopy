@@ -1,5 +1,6 @@
 sim2real:
   # 4x2 映射矩阵：[delta_yaw, delta_pitch] (rad/step) -> 4 个电机位移变化量 (mm/step)
+  # 列定义：第 1 列 = 偏航 yaw；第 2 列 = 俯仰 pitch。
   # bridge 内部会把变化量累加为“电机绝对位移目标”。
   # 上机前请替换为你的实机标定矩阵。
   J_4x2_mm_per_rad:
@@ -18,18 +19,22 @@ sim2real:
   # 串口下发频率（Hz）。仿真可高频运行，bridge 会按该频率节流下发 CMD。
   control_hz: 30.0
 
-  # 电机通道顺序（用于协议可读性与下游映射）
+  # CMD 下发通道顺序（J 的行默认按 m1,m2,m3,m4 解释；这里用于重排到硬件通道顺序）
   motor_order: ["m1", "m2", "m3", "m4"]
 
   serial:
     port: "/dev/pts/3"
     baudrate: 115200
     timeout: 0.0
+    # 关键控制帧（ESTOP/RESET）最少重发次数
+    critical_retry_count: 3
+    # 关键控制帧重发间隔（秒）
+    critical_retry_interval_sec: 0.02
 
   # ESTOP 锁存后的终端报警行为
   alarm:
     enabled: true
-    repeat: 1
+    repeat: 3
     terminal_bell: true
     banner_width: 70
 

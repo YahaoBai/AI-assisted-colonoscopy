@@ -6,6 +6,8 @@
 #include <termios.h>  // POSIX 终端控制定义
 #include <string>
 #include <cstdio>
+#include <algorithm>
+#include <cmath>
 
 // 1. 初始化底层串口通信
 int init_serial_port(const char* port_name) {
@@ -52,6 +54,7 @@ int main() {
     std::string buffer = "";
     char read_buf[256];
     bool estop_latched = false;
+    constexpr float MOTOR_LIMIT_MM = 15.0f;
 
     // 2. 机器人实时控制主循环
     while (true) {
@@ -73,6 +76,10 @@ int main() {
                     frame.pop_back();
                 }
                 if (frame.empty()) {
+                    continue;
+                }
+                if (frame.size() > 128) {
+                    std::cout << "[硬件层告警] 丢弃超长帧: " << frame.substr(0, 80) << "..." << std::endl;
                     continue;
                 }
 
@@ -101,11 +108,32 @@ int main() {
 
                     float m1 = 0.0f, m2 = 0.0f, m3 = 0.0f, m4 = 0.0f;
                     if (sscanf(frame.c_str(), "CMD,%f,%f,%f,%f", &m1, &m2, &m3, &m4) == 4) {
+                        if (!std::isfinite(m1) || !std::isfinite(m2) || !std::isfinite(m3) || !std::isfinite(m4)) {
+                            std::cout << "[硬件层告警] CMD 含非法数值(NaN/Inf), 已拒绝: " << frame << std::endl;
+                            continue;
+                        }
+
+                        const float raw_targets[4] = {m1, m2, m3, m4};
+                        float safe_targets[4] = {m1, m2, m3, m4};
+                        bool clipped = false;
+
+                        for (int i = 0; i < 4; ++i) {
+                            safe_targets[i] = std::clamp(raw_targets[i], -MOTOR_LIMIT_MM, MOTOR_LIMIT_MM);
+                            if (safe_targets[i] != raw_targets[i]) {
+                                clipped = true;
+                            }
+                        }
+
+                        if (clipped) {
+                            std::cout << "[硬件层限幅] CMD 目标超出 ±" << MOTOR_LIMIT_MM
+                                      << "mm，已二次裁切后执行。" << std::endl;
+                        }
+
                         std::cout << "[硬件层执行] MotorTarget(mm): "
-                                  << "m1=" << m1 << ", "
-                                  << "m2=" << m2 << ", "
-                                  << "m3=" << m3 << ", "
-                                  << "m4=" << m4 << std::endl;
+                                  << "m1=" << safe_targets[0] << ", "
+                                  << "m2=" << safe_targets[1] << ", "
+                                  << "m3=" << safe_targets[2] << ", "
+                                  << "m4=" << safe_targets[3] << std::endl;
                     } else {
                         std::cout << "[硬件层告警] CMD 解析失败: " << frame << std::endl;
                     }

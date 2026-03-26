@@ -82,6 +82,28 @@ class Sim2RealBridgeTests(unittest.TestCase):
             np.array([15.0, -15.0, 15.0, -15.0], dtype=np.float64),
         )
 
+    def test_motor_order_reorders_cmd_channels(self) -> None:
+        bridge = Sim2RealBridge(
+            Sim2RealConfig(
+                J_4x2_mm_per_rad=self.J,
+                yaw_limit_deg=120.0,
+                pitch_limit_deg=120.0,
+                motor_limit_mm=15.0,
+                control_hz=30.0,
+                motor_order=("m2", "m1", "m4", "m3"),
+            )
+        )
+
+        dyaw, dpitch = 0.2, -0.1
+        result = bridge.step(dyaw, dpitch, dt=1.0 / 30.0)
+        expected = self.J @ np.array([dyaw, dpitch], dtype=np.float64)
+
+        frame_vals = [float(v) for v in result.serial_frame.strip().split(",")[1:]]
+        expected_cmd_order = [expected[1], expected[0], expected[3], expected[2]]
+
+        self.assertTrue(result.should_send)
+        np.testing.assert_allclose(frame_vals, expected_cmd_order)
+
     def test_30hz_schedule_on_200hz_sim(self) -> None:
         send_count = 0
         total_steps = 200
@@ -138,11 +160,13 @@ sim2real:
   pitch_limit_deg: 110.0
   motor_limit_mm: 12.5
   control_hz: 25.0
-  motor_order: ["a", "b", "c", "d"]
+  motor_order: ["m2", "m1", "m4", "m3"]
   serial:
     port: "/dev/pts/8"
     baudrate: 230400
     timeout: 0.05
+    critical_retry_count: 5
+    critical_retry_interval_sec: 0.03
   alarm:
     enabled: true
     repeat: 2
@@ -169,8 +193,11 @@ sim2real:
         )
         self.assertEqual(runtime_cfg.bridge.serial_port, "/dev/pts/8")
         self.assertEqual(runtime_cfg.bridge.serial_baudrate, 230400)
+        self.assertEqual(runtime_cfg.bridge.serial_critical_retry_count, 5)
+        self.assertAlmostEqual(runtime_cfg.bridge.serial_critical_retry_interval_sec, 0.03)
         self.assertAlmostEqual(runtime_cfg.bridge.motor_limit_mm, 12.5)
         self.assertAlmostEqual(runtime_cfg.bridge.control_hz, 25.0)
+        self.assertEqual(runtime_cfg.bridge.motor_order, ("m2", "m1", "m4", "m3"))
         self.assertTrue(runtime_cfg.alarm.enabled)
         self.assertEqual(runtime_cfg.alarm.repeat, 2)
         self.assertFalse(runtime_cfg.alarm.terminal_bell)

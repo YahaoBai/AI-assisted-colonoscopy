@@ -37,7 +37,6 @@ from control.sim2real_bridge import (
     BridgeCommand,
     DaggerSim2RealRuntimeConfig,
     Sim2RealBridge,
-    default_dagger_sim2real_runtime_config,
     load_dagger_sim2real_runtime_config,
 )
 
@@ -142,9 +141,10 @@ try:
     )
     print(f">>> Sim2Real YAML 配置加载成功: {SIM2REAL_CONFIG_PATH}")
 except Exception as e:
-    print(f"⚠️ Sim2Real YAML 配置加载失败: {e}")
-    print("⚠️ 将回退到内置默认配置，请尽快修复 YAML 文件。")
-    runtime_cfg = default_dagger_sim2real_runtime_config()
+    print(f"❌ 致命错误: Sim2Real YAML 配置加载失败: {e}")
+    print("❌ 为保证实机安全，程序拒绝启动。请修复 YAML 后重试。")
+    listener.stop()
+    raise SystemExit(1)
 
 sim2real_cfg = runtime_cfg.bridge
 estop_alarm_cfg = runtime_cfg.alarm
@@ -153,29 +153,67 @@ sim2real_bridge = Sim2RealBridge(sim2real_cfg)
 
 serial_link = None
 if serial is None:
-    print("⚠️ 未安装 pyserial，Sim2Real 指令将仅打印，不会下发到底层串口。")
-else:
+    print("❌ 致命错误: 未安装 pyserial，无法建立 Sim2Real 串口链路。")
+    print("❌ 为保证实机安全，程序拒绝启动。")
+    listener.stop()
+    raise SystemExit(1)
+
+try:
+    serial_link = serial.Serial(
+        sim2real_cfg.serial_port,
+        baudrate=sim2real_cfg.serial_baudrate,
+        timeout=sim2real_cfg.serial_timeout,
+    )
+    print(f">>> Sim2Real 串口链路已挂载: {sim2real_cfg.serial_port}")
+except Exception as e:
+    print(f"❌ 致命错误: Sim2Real 串口挂载失败: {e}")
+    print("❌ 为保证实机安全，程序拒绝启动。")
+    listener.stop()
+    raise SystemExit(1)
+
+
+def send_serial_frame(frame: str) -> bool:
+    if serial_link is None:
+        print(f"❌ [Sim2Real] 串口链路未就绪，拒绝发送: {frame.strip()}")
+        return False
+
+    payload = frame.encode("utf-8")
+
     try:
-        serial_link = serial.Serial(
-            sim2real_cfg.serial_port,
-            baudrate=sim2real_cfg.serial_baudrate,
-            timeout=sim2real_cfg.serial_timeout,
-        )
-        print(f">>> Sim2Real 串口链路已挂载: {sim2real_cfg.serial_port}")
+        bytes_written = serial_link.write(payload)
+        serial_link.flush()
     except Exception as e:
-        print(f"⚠️ Sim2Real 串口挂载失败: {e}，将切换为仅打印模式。")
-        serial_link = None
+        print(f"⚠️ 串口发送失败: {e} | frame={frame.strip()}")
+        return False
 
+    if bytes_written != len(payload):
+        print(
+            f"⚠️ 串口发送不完整: wrote={bytes_written} expected={len(payload)} | frame={frame.strip()}"
+        )
+        return False
 
-def send_serial_frame(frame: str) -> None:
-    if serial_link is not None:
-        try:
-            serial_link.write(frame.encode("utf-8"))
-        except Exception as e:
-            print(f"⚠️ 串口发送失败: {e} | frame={frame.strip()}")
-            return
     if motor_output_cfg.print_tx_frame:
         print(f"[Sim2Real TX] {frame.strip()}")
+
+    return True
+
+
+def send_critical_frame(frame: str, frame_name: str) -> bool:
+    retry_count = int(max(1, sim2real_cfg.serial_critical_retry_count))
+    retry_interval = float(max(0.0, sim2real_cfg.serial_critical_retry_interval_sec))
+
+    for attempt in range(1, retry_count + 1):
+        if send_serial_frame(frame):
+            if attempt > 1:
+                print(f"✅ [Sim2Real] 关键帧 {frame_name} 在第 {attempt} 次重发后成功。")
+            return True
+
+        print(f"⚠️ [Sim2Real] 关键帧 {frame_name} 发送失败（{attempt}/{retry_count}）。")
+        if attempt < retry_count and retry_interval > 0.0:
+            time.sleep(retry_interval)
+
+    print(f"❌ [Sim2Real] 关键帧 {frame_name} 连续 {retry_count} 次发送失败: {frame.strip()}")
+    return False
 
 
 def emit_estop_alarm(frame_idx: int, reason: str, yaw_rad: float, pitch_rad: float) -> None:
@@ -351,9 +389,16 @@ try:
             if key_states['reset_estop_pressed']:
                 key_states['reset_estop_pressed'] = False
                 sim2real_bridge.reset()
-                for frame in sim2real_bridge.get_reset_frames():
-                    send_serial_frame(frame)
-                print(">>> [Sim2Real] 已清除急停锁存，累计角归零并下发零位。")
+                reset_frame, zero_frame = sim2real_bridge.get_reset_frames()
+                reset_ok = send_critical_frame(reset_frame, "RESET")
+                zero_ok = send_critical_frame(zero_frame, "CMD_ZERO")
+
+                if reset_ok and zero_ok:
+                    print(">>> [Sim2Real] 已清除急停锁存，累计角归零并下发零位。")
+                else:
+                    sim2real_bridge.estop_latched = True
+                    key_states['autopilot_on'] = False
+                    print("❌ [Sim2Real] RESET/回零下发失败，已保持锁存。请检查串口后按 [R] 重试。")
 
             if sim2real_bridge.estop_latched and key_states['autopilot_on']:
                 key_states['autopilot_on'] = False
@@ -408,10 +453,11 @@ try:
                     #print(f">>> [实时延迟] U-Net感知 -> Policy决策: {latency_ms:.2f} ms")
 
                     bridge_result = sim2real_bridge.step(step_yaw, step_pitch, dt)
-                    if bridge_result.should_send and bridge_result.serial_frame:
-                        send_serial_frame(bridge_result.serial_frame)
 
                     if bridge_result.command == BridgeCommand.ESTOP:
+                        estop_tx_ok = send_critical_frame(bridge_result.serial_frame, "ESTOP")
+                        if not estop_tx_ok:
+                            print("❌ [Sim2Real] ESTOP 下发失败，请立即人工确认底层处于安全状态。")
                         key_states['autopilot_on'] = False
                         is_slowing_down = False
                         speed_trigger_counter = 0
@@ -431,7 +477,9 @@ try:
                             f"pitch={np.rad2deg(bridge_result.pitch_accum_rad):.2f}° | 按 [R] 复位"
                         )
                     else:
-                        if bridge_result.should_send:
+                        if bridge_result.should_send and bridge_result.serial_frame:
+                            if not send_serial_frame(bridge_result.serial_frame):
+                                print("⚠️ [Sim2Real] CMD 下发失败，本帧目标未成功发送到底层。")
                             record_motor_target(frame_count, bridge_result.motor_target_mm)
 
                         # [状态机]: 动态降速逻辑与冷却保护
