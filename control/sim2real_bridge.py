@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 import math
 from pathlib import Path
-from typing import Any, Mapping, Sequence, Tuple
+import time
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import numpy as np
 
@@ -34,9 +35,10 @@ class Sim2RealConfig:
     motor_limit_mm: float = 15.0
     control_hz: float = 30.0
     motor_order: Tuple[str, str, str, str] = ("m1", "m2", "m3", "m4")
-    serial_port: str = "/dev/pts/3"
+    serial_port: str = "/dev/ttyUSB0"
     serial_baudrate: int = 115200
     serial_timeout: float = 0.0
+    serial_write_timeout: float = 0.2
     serial_critical_retry_count: int = 3
     serial_critical_retry_interval_sec: float = 0.02
 
@@ -56,6 +58,9 @@ class Sim2RealConfig:
             raise ValueError("motor_limit_mm must be > 0")
         if float(self.control_hz) <= 0.0:
             raise ValueError("control_hz must be > 0")
+        self.serial_write_timeout = float(self.serial_write_timeout)
+        if self.serial_write_timeout < 0.0:
+            raise ValueError("serial_write_timeout must be >= 0")
         self.serial_critical_retry_count = max(1, int(self.serial_critical_retry_count))
         self.serial_critical_retry_interval_sec = float(self.serial_critical_retry_interval_sec)
         if self.serial_critical_retry_interval_sec < 0.0:
@@ -92,8 +97,118 @@ class MotorOutputConfig:
 
 
 @dataclass
+class MotorAxisMapConfig:
+    zero_count: int = 1000
+    count_per_mm: float = 20.0
+    sign: int = 1
+    soft_min_count: int = 300
+    soft_max_count: int = 1700
+
+    def __post_init__(self) -> None:
+        self.zero_count = int(self.zero_count)
+        self.count_per_mm = float(self.count_per_mm)
+        self.sign = -1 if int(self.sign) < 0 else 1
+        self.soft_min_count = int(self.soft_min_count)
+        self.soft_max_count = int(self.soft_max_count)
+
+        if self.count_per_mm <= 0.0:
+            raise ValueError("count_per_mm must be > 0")
+        if self.soft_min_count > self.soft_max_count:
+            raise ValueError("soft_min_count must be <= soft_max_count")
+
+
+@dataclass
+class ActuatorConfig:
+    mode: str = "broadcast_follow_no_feedback"
+    # ids 语义固定为 [m1,m2,m3,m4]，不随 motor_order 改变
+    ids: Tuple[int, int, int, int] = (1, 2, 3, 4)
+    # 显式语义映射，避免 ids 与 motor_order 关系仅靠人工约定
+    id_by_motor: Mapping[str, int] = field(
+        default_factory=lambda: {"m1": 1, "m2": 2, "m3": 3, "m4": 4}
+    )
+    position_index: int = 0x37
+    count_min: int = 0
+    count_max: int = 2000
+    m1: MotorAxisMapConfig = field(default_factory=MotorAxisMapConfig)
+    m2: MotorAxisMapConfig = field(default_factory=MotorAxisMapConfig)
+    m3: MotorAxisMapConfig = field(default_factory=MotorAxisMapConfig)
+    m4: MotorAxisMapConfig = field(default_factory=MotorAxisMapConfig)
+
+    def __post_init__(self) -> None:
+        mode = str(self.mode).strip().lower()
+        if mode not in {"broadcast_follow_no_feedback"}:
+            raise ValueError(
+                "actuator.mode must be 'broadcast_follow_no_feedback' in this stage."
+            )
+        self.mode = mode
+
+        ids_tuple = tuple(int(x) for x in self.ids)
+        if len(ids_tuple) != 4:
+            raise ValueError(f"actuator.ids must contain 4 ids, got {len(ids_tuple)}")
+        if len(set(ids_tuple)) != 4:
+            raise ValueError("actuator.ids must be unique.")
+        for aid in ids_tuple:
+            if not (1 <= aid <= 254):
+                raise ValueError(f"actuator id out of range [1,254]: {aid}")
+
+        raw_id_by_motor = self.id_by_motor
+        if not isinstance(raw_id_by_motor, Mapping):
+            raise ValueError("actuator.id_by_motor must be a mapping/object.")
+
+        id_map: Dict[str, int] = {}
+        for name in MOTOR_NAME_SET:
+            if name not in raw_id_by_motor:
+                raise ValueError(f"`sim2real.actuator.id_by_motor.{name}` is required.")
+            aid = int(raw_id_by_motor[name])
+            if not (1 <= aid <= 254):
+                raise ValueError(f"actuator id_by_motor.{name} out of range [1,254]: {aid}")
+            id_map[name] = aid
+        if len(set(id_map.values())) != 4:
+            raise ValueError("actuator.id_by_motor ids must be unique.")
+
+        expected_ids = tuple(id_map[name] for name in MOTOR_NAME_SET)
+        if ids_tuple != expected_ids:
+            raise ValueError(
+                "actuator.ids must follow semantic order [m1,m2,m3,m4] and match actuator.id_by_motor."
+            )
+
+        self.ids = ids_tuple
+        self.id_by_motor = id_map
+
+        self.position_index = _coerce_int(self.position_index)
+        if not (0 <= self.position_index <= 255):
+            raise ValueError("actuator.position_index must be in [0,255]")
+
+        self.count_min = int(self.count_min)
+        self.count_max = int(self.count_max)
+        if self.count_min >= self.count_max:
+            raise ValueError("actuator.count_min must be < actuator.count_max")
+
+        for name in MOTOR_NAME_SET:
+            cfg = getattr(self, name)
+            if not isinstance(cfg, MotorAxisMapConfig):
+                raise ValueError(f"actuator.per_motor.{name} config is invalid")
+            if cfg.soft_min_count < self.count_min or cfg.soft_max_count > self.count_max:
+                raise ValueError(
+                    f"actuator.per_motor.{name}.soft_* must be within [{self.count_min},{self.count_max}]"
+                )
+
+    def axis_cfg(self, motor_name: str) -> MotorAxisMapConfig:
+        if motor_name not in MOTOR_NAME_SET:
+            raise KeyError(f"unknown motor name: {motor_name}")
+        return getattr(self, motor_name)
+
+    def ids_for_motor_order(self, motor_order: Sequence[str]) -> Tuple[int, int, int, int]:
+        order = tuple(str(x).strip() for x in motor_order)
+        if len(order) != 4 or set(order) != set(MOTOR_NAME_SET):
+            raise ValueError("motor_order must be a permutation of ('m1','m2','m3','m4').")
+        return tuple(int(self.id_by_motor[name]) for name in order)
+
+
+@dataclass
 class DaggerSim2RealRuntimeConfig:
     bridge: Sim2RealConfig
+    actuator: ActuatorConfig
     alarm: EstopAlarmConfig
     output: MotorOutputConfig
 
@@ -101,8 +216,8 @@ class DaggerSim2RealRuntimeConfig:
 @dataclass
 class BridgeResult:
     command: BridgeCommand
-    serial_frame: str
     should_send: bool = False
+    serial_frame: str = ""
     motor_delta_mm: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=np.float64))
     motor_target_mm: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=np.float64))
     yaw_accum_rad: float = 0.0
@@ -123,15 +238,10 @@ class Sim2RealBridge:
         self.motor_target_mm = np.zeros(4, dtype=np.float64)
         self.control_dt_accum = 0.0
         self.estop_latched = False
-        self.cmd_send_indices = tuple(MOTOR_NAME_SET.index(name) for name in self.config.motor_order)
-
-    def _motor_target_for_cmd_order(self, motor_target_mm: np.ndarray) -> np.ndarray:
-        return np.asarray(motor_target_mm, dtype=np.float64)[list(self.cmd_send_indices)]
 
     def _make_estop(self, reason: str) -> BridgeResult:
         return BridgeResult(
             command=BridgeCommand.ESTOP,
-            serial_frame=self.build_estop_frame(reason),
             should_send=True,
             motor_target_mm=self.motor_target_mm.copy(),
             yaw_accum_rad=self.yaw_accum_rad,
@@ -179,15 +289,8 @@ class Sim2RealBridge:
                 should_send = True
                 self.control_dt_accum = math.fmod(self.control_dt_accum, self.control_period_sec)
 
-        cmd_frame = (
-            self.build_cmd_frame(self._motor_target_for_cmd_order(self.motor_target_mm).tolist())
-            if should_send
-            else ""
-        )
-
         return BridgeResult(
             command=BridgeCommand.CMD,
-            serial_frame=cmd_frame,
             should_send=should_send,
             motor_delta_mm=motor_delta_mm,
             motor_target_mm=self.motor_target_mm.copy(),
@@ -202,31 +305,166 @@ class Sim2RealBridge:
         self.control_dt_accum = 0.0
         self.estop_latched = False
 
-    def get_reset_frames(self) -> Tuple[str, str]:
-        zero_target_cmd_order = self._motor_target_for_cmd_order(np.zeros(4, dtype=np.float64))
-        return (
-            self.build_reset_frame(),
-            self.build_cmd_frame(zero_target_cmd_order.tolist()),
-        )
+
+class LAFrameBuilder:
+    @staticmethod
+    def checksum(frame_body: Sequence[int]) -> int:
+        return sum(int(x) for x in frame_body) & 0xFF
 
     @staticmethod
-    def build_cmd_frame(motor_target_mm: Sequence[float]) -> str:
-        if len(motor_target_mm) != 4:
-            raise ValueError(f"motor_target_mm must contain 4 entries, got {len(motor_target_mm)}")
-        return "CMD,{:.6f},{:.6f},{:.6f},{:.6f}\n".format(
-            float(motor_target_mm[0]),
-            float(motor_target_mm[1]),
-            float(motor_target_mm[2]),
-            float(motor_target_mm[3]),
-        )
+    def build_single_control_frame(actuator_id: int, cmd_value: int) -> bytes:
+        aid = int(actuator_id)
+        cmd = int(cmd_value)
+        if not (1 <= aid <= 254):
+            raise ValueError(f"actuator_id out of range [1,254]: {aid}")
+        if not (0 <= cmd <= 255):
+            raise ValueError(f"cmd_value out of range [0,255]: {cmd}")
+
+        body = [0x03, aid, 0x04, 0x00, cmd]
+        return bytes([0x55, 0xAA] + body + [LAFrameBuilder.checksum(body)])
 
     @staticmethod
-    def build_estop_frame(reason: str = "ANGLE_LIMIT") -> str:
-        return f"ESTOP,{reason}\n"
+    def build_follow_broadcast_frame(actuator_ids: Sequence[int], target_counts: Sequence[int]) -> bytes:
+        if len(actuator_ids) != len(target_counts):
+            raise ValueError("actuator_ids and target_counts length mismatch")
 
-    @staticmethod
-    def build_reset_frame() -> str:
-        return "RESET\n"
+        n = len(actuator_ids)
+        if n < 1 or n > 15:
+            raise ValueError(f"broadcast follow supports 1~15 actuators, got {n}")
+
+        body = [1 + 3 * n, 0xFF, 0xF3]
+        for aid_raw, count_raw in zip(actuator_ids, target_counts):
+            aid = int(aid_raw)
+            count = int(count_raw)
+            if not (1 <= aid <= 254):
+                raise ValueError(f"actuator_id out of range [1,254]: {aid}")
+            if not (0 <= count <= 0xFFFF):
+                raise ValueError(f"target count out of range [0,65535]: {count}")
+            body.extend([aid, count & 0xFF, (count >> 8) & 0xFF])
+
+        return bytes([0x55, 0xAA] + body + [LAFrameBuilder.checksum(body)])
+
+
+class MotorMapper:
+    def __init__(self, actuator_cfg: ActuatorConfig, motor_order: Sequence[str]):
+        self.actuator_cfg = actuator_cfg
+        motor_order_tuple = tuple(str(x).strip() for x in motor_order)
+        if len(motor_order_tuple) != 4 or set(motor_order_tuple) != set(MOTOR_NAME_SET):
+            raise ValueError("motor_order must be a permutation of ('m1','m2','m3','m4').")
+        self.motor_order = motor_order_tuple
+        self.semantic_index = {name: idx for idx, name in enumerate(MOTOR_NAME_SET)}
+
+    def mm_targets_to_counts(self, mm_targets: np.ndarray) -> np.ndarray:
+        arr = np.asarray(mm_targets, dtype=np.float64).reshape(-1)
+        if arr.shape != (4,):
+            raise ValueError(f"mm_targets must have shape (4,), got {arr.shape}")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("mm_targets contain non-finite values")
+
+        out = []
+        for motor_name in self.motor_order:
+            mm_val = float(arr[self.semantic_index[motor_name]])
+            axis_cfg = self.actuator_cfg.axis_cfg(motor_name)
+            raw = axis_cfg.zero_count + axis_cfg.sign * mm_val * axis_cfg.count_per_mm
+            clipped = np.clip(raw, axis_cfg.soft_min_count, axis_cfg.soft_max_count)
+            clipped = np.clip(clipped, self.actuator_cfg.count_min, self.actuator_cfg.count_max)
+            out.append(int(round(float(clipped))))
+        return np.asarray(out, dtype=np.int32)
+
+    def zero_counts(self) -> np.ndarray:
+        return self.mm_targets_to_counts(np.zeros(4, dtype=np.float64))
+
+
+class ActuatorTx:
+    def __init__(
+        self,
+        serial_link: Any,
+        critical_retry_count: int = 3,
+        critical_retry_interval_sec: float = 0.02,
+        print_tx_frame: bool = False,
+    ) -> None:
+        self.serial_link = serial_link
+        self.critical_retry_count = max(1, int(critical_retry_count))
+        self.critical_retry_interval_sec = max(0.0, float(critical_retry_interval_sec))
+        self.print_tx_frame = bool(print_tx_frame)
+
+    def send_frame(self, frame: bytes, frame_name: str = "FRAME") -> bool:
+        if self.serial_link is None:
+            print(f"❌ [ActuatorTx] 串口链路未就绪，拒绝发送 {frame_name}。")
+            return False
+
+        payload = bytes(frame)
+        try:
+            bytes_written = self.serial_link.write(payload)
+            self.serial_link.flush()
+        except Exception as exc:
+            print(f"⚠️ [ActuatorTx] 串口发送失败: {exc} | {frame_name}")
+            return False
+
+        if bytes_written != len(payload):
+            print(
+                f"⚠️ [ActuatorTx] 串口短写: wrote={bytes_written} expected={len(payload)} | {frame_name}"
+            )
+            return False
+
+        if self.print_tx_frame:
+            print(f"[ActuatorTx TX] {frame_name}: {payload.hex(' ').upper()}")
+        return True
+
+    def send_critical(self, frames: Sequence[bytes], frame_name: str) -> bool:
+        frame_seq = [bytes(x) for x in frames]
+        if len(frame_seq) == 0:
+            return True
+
+        for attempt in range(1, self.critical_retry_count + 1):
+            ok = True
+            for idx, frame in enumerate(frame_seq):
+                if not self.send_frame(frame, f"{frame_name}[{idx}]"):
+                    ok = False
+                    break
+            if ok:
+                if attempt > 1:
+                    print(f"✅ [ActuatorTx] 关键帧 {frame_name} 在第 {attempt} 次重发后成功。")
+                return True
+
+            print(
+                f"⚠️ [ActuatorTx] 关键帧 {frame_name} 发送失败（{attempt}/{self.critical_retry_count}）。"
+            )
+            if attempt < self.critical_retry_count and self.critical_retry_interval_sec > 0.0:
+                time.sleep(self.critical_retry_interval_sec)
+
+        print(f"❌ [ActuatorTx] 关键帧 {frame_name} 连续 {self.critical_retry_count} 次发送失败。")
+        return False
+
+    def send_follow_broadcast(
+        self,
+        actuator_ids: Sequence[int],
+        target_counts: Sequence[int],
+        critical: bool = False,
+        frame_name: str = "F3_FOLLOW",
+    ) -> bool:
+        frame = LAFrameBuilder.build_follow_broadcast_frame(actuator_ids, target_counts)
+        if critical:
+            return self.send_critical([frame], frame_name)
+        return self.send_frame(frame, frame_name)
+
+    def send_estop_all(self, actuator_ids: Sequence[int], critical: bool = True) -> bool:
+        frames = [LAFrameBuilder.build_single_control_frame(aid, 0x23) for aid in actuator_ids]
+        if critical:
+            return self.send_critical(frames, "ESTOP_ALL")
+        ok = True
+        for idx, frame in enumerate(frames):
+            ok = self.send_frame(frame, f"ESTOP[{idx}]") and ok
+        return ok
+
+    def send_work_start_all(self, actuator_ids: Sequence[int], critical: bool = True) -> bool:
+        frames = [LAFrameBuilder.build_single_control_frame(aid, 0x04) for aid in actuator_ids]
+        if critical:
+            return self.send_critical(frames, "WORK_START_ALL")
+        ok = True
+        for idx, frame in enumerate(frames):
+            ok = self.send_frame(frame, f"WORK_START[{idx}]") and ok
+        return ok
 
 
 def default_dagger_sim2real_runtime_config() -> DaggerSim2RealRuntimeConfig:
@@ -237,11 +475,24 @@ def default_dagger_sim2real_runtime_config() -> DaggerSim2RealRuntimeConfig:
         motor_limit_mm=15.0,
         control_hz=30.0,
         motor_order=("m1", "m2", "m3", "m4"),
-        serial_port="/dev/pts/3",
+        serial_port="/dev/ttyUSB0",
         serial_baudrate=115200,
         serial_timeout=0.0,
+        serial_write_timeout=0.2,
         serial_critical_retry_count=3,
         serial_critical_retry_interval_sec=0.02,
+    )
+    actuator_cfg = ActuatorConfig(
+        mode="broadcast_follow_no_feedback",
+        ids=(1, 2, 3, 4),
+        id_by_motor={"m1": 1, "m2": 2, "m3": 3, "m4": 4},
+        position_index=0x37,
+        count_min=0,
+        count_max=2000,
+        m1=MotorAxisMapConfig(zero_count=1000, count_per_mm=20.0, sign=1, soft_min_count=300, soft_max_count=1700),
+        m2=MotorAxisMapConfig(zero_count=1000, count_per_mm=20.0, sign=1, soft_min_count=300, soft_max_count=1700),
+        m3=MotorAxisMapConfig(zero_count=1000, count_per_mm=20.0, sign=1, soft_min_count=300, soft_max_count=1700),
+        m4=MotorAxisMapConfig(zero_count=1000, count_per_mm=20.0, sign=1, soft_min_count=300, soft_max_count=1700),
     )
     alarm_cfg = EstopAlarmConfig(
         enabled=True,
@@ -259,7 +510,12 @@ def default_dagger_sim2real_runtime_config() -> DaggerSim2RealRuntimeConfig:
         plot_dpi=120,
         max_plot_points=4000,
     )
-    return DaggerSim2RealRuntimeConfig(bridge=bridge_cfg, alarm=alarm_cfg, output=output_cfg)
+    return DaggerSim2RealRuntimeConfig(
+        bridge=bridge_cfg,
+        actuator=actuator_cfg,
+        alarm=alarm_cfg,
+        output=output_cfg,
+    )
 
 
 def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2RealRuntimeConfig:
@@ -303,6 +559,12 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
     if not isinstance(output_raw, Mapping):
         raise ValueError("`sim2real.output` must be a mapping/object.")
 
+    actuator_raw = sim2real_raw.get("actuator", None)
+    if actuator_raw is None:
+        raise ValueError("`sim2real.actuator` is required for direct LA actuator control.")
+    if not isinstance(actuator_raw, Mapping):
+        raise ValueError("`sim2real.actuator` must be a mapping/object.")
+
     motor_order_raw = sim2real_raw.get("motor_order", defaults.bridge.motor_order)
     if isinstance(motor_order_raw, str):
         raise ValueError("`sim2real.motor_order` must be a list containing m1,m2,m3,m4 in some order.")
@@ -324,6 +586,9 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
         serial_port=str(serial_raw.get("port", defaults.bridge.serial_port)),
         serial_baudrate=int(serial_raw.get("baudrate", defaults.bridge.serial_baudrate)),
         serial_timeout=float(serial_raw.get("timeout", defaults.bridge.serial_timeout)),
+        serial_write_timeout=float(
+            serial_raw.get("write_timeout", defaults.bridge.serial_write_timeout)
+        ),
         serial_critical_retry_count=int(
             serial_raw.get("critical_retry_count", defaults.bridge.serial_critical_retry_count)
         ),
@@ -333,6 +598,27 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
                 defaults.bridge.serial_critical_retry_interval_sec,
             )
         ),
+    )
+
+    per_motor_raw = actuator_raw.get("per_motor", None)
+    if per_motor_raw is None or not isinstance(per_motor_raw, Mapping):
+        raise ValueError("`sim2real.actuator.per_motor` must be a mapping and include m1~m4.")
+
+    id_by_motor_raw = actuator_raw.get("id_by_motor", None)
+    if id_by_motor_raw is None or not isinstance(id_by_motor_raw, Mapping):
+        raise ValueError("`sim2real.actuator.id_by_motor` must be a mapping and include m1~m4.")
+
+    actuator_cfg = ActuatorConfig(
+        mode=str(actuator_raw.get("mode", defaults.actuator.mode)),
+        ids=tuple(int(x) for x in actuator_raw.get("ids", defaults.actuator.ids)),
+        id_by_motor=_load_id_by_motor_cfg(id_by_motor_raw),
+        position_index=_coerce_int(actuator_raw.get("position_index", defaults.actuator.position_index)),
+        count_min=int(actuator_raw.get("count_min", defaults.actuator.count_min)),
+        count_max=int(actuator_raw.get("count_max", defaults.actuator.count_max)),
+        m1=_load_axis_map_cfg(per_motor_raw, "m1", defaults.actuator.m1),
+        m2=_load_axis_map_cfg(per_motor_raw, "m2", defaults.actuator.m2),
+        m3=_load_axis_map_cfg(per_motor_raw, "m3", defaults.actuator.m3),
+        m4=_load_axis_map_cfg(per_motor_raw, "m4", defaults.actuator.m4),
     )
 
     alarm_cfg = EstopAlarmConfig(
@@ -353,7 +639,12 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
         max_plot_points=int(output_raw.get("max_plot_points", defaults.output.max_plot_points)),
     )
 
-    return DaggerSim2RealRuntimeConfig(bridge=bridge_cfg, alarm=alarm_cfg, output=output_cfg)
+    return DaggerSim2RealRuntimeConfig(
+        bridge=bridge_cfg,
+        actuator=actuator_cfg,
+        alarm=alarm_cfg,
+        output=output_cfg,
+    )
 
 
 def _coerce_matrix(value: Any) -> np.ndarray:
@@ -361,3 +652,38 @@ def _coerce_matrix(value: Any) -> np.ndarray:
     if arr.shape != (4, 2):
         raise ValueError(f"`sim2real.J_4x2_mm_per_rad` must have shape (4,2), got {arr.shape}")
     return arr
+
+
+def _coerce_int(value: Any) -> int:
+    if isinstance(value, str):
+        return int(value, 0)
+    return int(value)
+
+
+def _load_id_by_motor_cfg(raw: Mapping[str, Any]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for name in MOTOR_NAME_SET:
+        if name not in raw:
+            raise ValueError(f"`sim2real.actuator.id_by_motor.{name}` is required.")
+        out[name] = _coerce_int(raw[name])
+    return out
+
+
+def _load_axis_map_cfg(
+    per_motor_raw: Mapping[str, Any],
+    axis_name: str,
+    defaults: MotorAxisMapConfig,
+) -> MotorAxisMapConfig:
+    axis_raw = per_motor_raw.get(axis_name, None)
+    if axis_raw is None:
+        raise ValueError(f"`sim2real.actuator.per_motor.{axis_name}` is required.")
+    if not isinstance(axis_raw, Mapping):
+        raise ValueError(f"`sim2real.actuator.per_motor.{axis_name}` must be a mapping/object.")
+
+    return MotorAxisMapConfig(
+        zero_count=int(axis_raw.get("zero_count", defaults.zero_count)),
+        count_per_mm=float(axis_raw.get("count_per_mm", defaults.count_per_mm)),
+        sign=int(axis_raw.get("sign", defaults.sign)),
+        soft_min_count=int(axis_raw.get("soft_min_count", defaults.soft_min_count)),
+        soft_max_count=int(axis_raw.get("soft_max_count", defaults.soft_max_count)),
+    )

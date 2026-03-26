@@ -34,8 +34,10 @@ except ImportError as e:
     exit()
 
 from control.sim2real_bridge import (
+    ActuatorTx,
     BridgeCommand,
     DaggerSim2RealRuntimeConfig,
+    MotorMapper,
     Sim2RealBridge,
     load_dagger_sim2real_runtime_config,
 )
@@ -147,9 +149,16 @@ except Exception as e:
     raise SystemExit(1)
 
 sim2real_cfg = runtime_cfg.bridge
+actuator_cfg = runtime_cfg.actuator
 estop_alarm_cfg = runtime_cfg.alarm
 motor_output_cfg = runtime_cfg.output
 sim2real_bridge = Sim2RealBridge(sim2real_cfg)
+motor_mapper = MotorMapper(actuator_cfg, sim2real_cfg.motor_order)
+actuator_ids = actuator_cfg.ids_for_motor_order(sim2real_cfg.motor_order)
+actuator_id_map_text = ", ".join(
+    f"{motor}->{aid}" for motor, aid in zip(sim2real_cfg.motor_order, actuator_ids)
+)
+print(f">>> Sim2Real 电机映射(语义->ID): {actuator_id_map_text}")
 
 serial_link = None
 if serial is None:
@@ -163,6 +172,7 @@ try:
         sim2real_cfg.serial_port,
         baudrate=sim2real_cfg.serial_baudrate,
         timeout=sim2real_cfg.serial_timeout,
+        write_timeout=sim2real_cfg.serial_write_timeout,
     )
     print(f">>> Sim2Real 串口链路已挂载: {sim2real_cfg.serial_port}")
 except Exception as e:
@@ -171,49 +181,59 @@ except Exception as e:
     listener.stop()
     raise SystemExit(1)
 
+actuator_tx = ActuatorTx(
+    serial_link,
+    critical_retry_count=sim2real_cfg.serial_critical_retry_count,
+    critical_retry_interval_sec=sim2real_cfg.serial_critical_retry_interval_sec,
+    print_tx_frame=motor_output_cfg.print_tx_frame,
+)
 
-def send_serial_frame(frame: str) -> bool:
-    if serial_link is None:
-        print(f"❌ [Sim2Real] 串口链路未就绪，拒绝发送: {frame.strip()}")
+
+def send_follow_target_mm(motor_target_mm: np.ndarray, frame_name: str = "F3_FOLLOW", critical: bool = False) -> bool:
+    try:
+        target_counts = motor_mapper.mm_targets_to_counts(motor_target_mm)
+    except Exception as e:
+        print(f"⚠️ [Sim2Real] mm->count 映射失败: {e}")
         return False
 
-    payload = frame.encode("utf-8")
+    return actuator_tx.send_follow_broadcast(
+        actuator_ids,
+        target_counts.tolist(),
+        critical=critical,
+        frame_name=frame_name,
+    )
+
+
+def send_estop_all_critical() -> bool:
+    return actuator_tx.send_estop_all(actuator_ids, critical=True)
+
+
+def send_work_start_all_critical() -> bool:
+    return actuator_tx.send_work_start_all(actuator_ids, critical=True)
+
+
+shutdown_estop_done = False
+
+
+def request_shutdown_estop(trigger: str) -> None:
+    global shutdown_estop_done
+
+    if shutdown_estop_done:
+        return
+
+    if serial_link is None or not getattr(serial_link, "is_open", False):
+        print(f">>> [Sim2Real] {trigger}：串口未就绪，无法再次下发全轴急停。")
+        return
 
     try:
-        bytes_written = serial_link.write(payload)
-        serial_link.flush()
+        estop_ok = send_estop_all_critical()
+        if estop_ok:
+            shutdown_estop_done = True
+            print(f">>> [Sim2Real] {trigger}：全轴急停已下发。")
+        else:
+            print(f"❌ [Sim2Real] {trigger}：全轴急停下发失败，请立即人工确认硬件急停。")
     except Exception as e:
-        print(f"⚠️ 串口发送失败: {e} | frame={frame.strip()}")
-        return False
-
-    if bytes_written != len(payload):
-        print(
-            f"⚠️ 串口发送不完整: wrote={bytes_written} expected={len(payload)} | frame={frame.strip()}"
-        )
-        return False
-
-    if motor_output_cfg.print_tx_frame:
-        print(f"[Sim2Real TX] {frame.strip()}")
-
-    return True
-
-
-def send_critical_frame(frame: str, frame_name: str) -> bool:
-    retry_count = int(max(1, sim2real_cfg.serial_critical_retry_count))
-    retry_interval = float(max(0.0, sim2real_cfg.serial_critical_retry_interval_sec))
-
-    for attempt in range(1, retry_count + 1):
-        if send_serial_frame(frame):
-            if attempt > 1:
-                print(f"✅ [Sim2Real] 关键帧 {frame_name} 在第 {attempt} 次重发后成功。")
-            return True
-
-        print(f"⚠️ [Sim2Real] 关键帧 {frame_name} 发送失败（{attempt}/{retry_count}）。")
-        if attempt < retry_count and retry_interval > 0.0:
-            time.sleep(retry_interval)
-
-    print(f"❌ [Sim2Real] 关键帧 {frame_name} 连续 {retry_count} 次发送失败: {frame.strip()}")
-    return False
+        print(f"❌ [Sim2Real] {trigger}：全轴急停异常: {e}")
 
 
 def emit_estop_alarm(frame_idx: int, reason: str, yaw_rad: float, pitch_rad: float) -> None:
@@ -388,17 +408,24 @@ try:
 
             if key_states['reset_estop_pressed']:
                 key_states['reset_estop_pressed'] = False
-                sim2real_bridge.reset()
-                reset_frame, zero_frame = sim2real_bridge.get_reset_frames()
-                reset_ok = send_critical_frame(reset_frame, "RESET")
-                zero_ok = send_critical_frame(zero_frame, "CMD_ZERO")
 
-                if reset_ok and zero_ok:
-                    print(">>> [Sim2Real] 已清除急停锁存，累计角归零并下发零位。")
+                if not sim2real_bridge.estop_latched:
+                    print(">>> [Sim2Real] 当前未处于急停锁存，已忽略 [R]，避免误触发工作启动/回零。")
                 else:
-                    sim2real_bridge.estop_latched = True
-                    key_states['autopilot_on'] = False
-                    print("❌ [Sim2Real] RESET/回零下发失败，已保持锁存。请检查串口后按 [R] 重试。")
+                    sim2real_bridge.reset()
+                    work_start_ok = send_work_start_all_critical()
+                    zero_ok = send_follow_target_mm(
+                        np.zeros(4, dtype=np.float64),
+                        frame_name="F3_FOLLOW_ZERO",
+                        critical=True,
+                    )
+
+                    if work_start_ok and zero_ok:
+                        print(">>> [Sim2Real] 已清除急停锁存，累计角归零并下发零位。")
+                    else:
+                        sim2real_bridge.estop_latched = True
+                        key_states['autopilot_on'] = False
+                        print("❌ [Sim2Real] RESET/回零下发失败，已保持锁存。请检查串口后按 [R] 重试。")
 
             if sim2real_bridge.estop_latched and key_states['autopilot_on']:
                 key_states['autopilot_on'] = False
@@ -455,7 +482,7 @@ try:
                     bridge_result = sim2real_bridge.step(step_yaw, step_pitch, dt)
 
                     if bridge_result.command == BridgeCommand.ESTOP:
-                        estop_tx_ok = send_critical_frame(bridge_result.serial_frame, "ESTOP")
+                        estop_tx_ok = send_estop_all_critical()
                         if not estop_tx_ok:
                             print("❌ [Sim2Real] ESTOP 下发失败，请立即人工确认底层处于安全状态。")
                         key_states['autopilot_on'] = False
@@ -477,37 +504,60 @@ try:
                             f"pitch={np.rad2deg(bridge_result.pitch_accum_rad):.2f}° | 按 [R] 复位"
                         )
                     else:
-                        if bridge_result.should_send and bridge_result.serial_frame:
-                            if not send_serial_frame(bridge_result.serial_frame):
-                                print("⚠️ [Sim2Real] CMD 下发失败，本帧目标未成功发送到底层。")
-                            record_motor_target(frame_count, bridge_result.motor_target_mm)
+                        send_ok = True
+                        if bridge_result.should_send:
+                            send_ok = send_follow_target_mm(
+                                bridge_result.motor_target_mm,
+                                frame_name="F3_FOLLOW",
+                                critical=False,
+                            )
+                            if send_ok:
+                                record_motor_target(frame_count, bridge_result.motor_target_mm)
 
-                        # [状态机]: 动态降速逻辑与冷却保护
-                        base_auto_speed = MANUAL_MOVE_SPEED * 0.85
-
-                        if total_norm_error > 0.18:
-                            speed_trigger_counter += 1
-                        else:
+                        if not send_ok:
+                            print("❌ [Sim2Real] 广播随动帧下发失败，立即锁存并急停。")
+                            sim2real_bridge.estop_latched = True
+                            key_states['autopilot_on'] = False
+                            send_estop_all_critical()
+                            is_slowing_down = False
                             speed_trigger_counter = 0
-
-                        if speed_trigger_counter >= TRIGGER_FRAMES:
-                            current_speed = base_auto_speed * 0.4
-                            speed_recovery_counter = RECOVERY_FRAMES  
-                            if not is_slowing_down:
-                                # 移除开头的 \n，使日志输出紧凑整齐
-                                print(f">>> [限速触发] 连续 {TRIGGER_FRAMES} 帧确认高曲率 | 推进速度降至: {current_speed:.3f}")
-                                is_slowing_down = True
+                            speed_recovery_counter = 0
+                            step_yaw = 0.0
+                            step_pitch = 0.0
+                            local_displacement[2] = 0.0
+                            emit_estop_alarm(
+                                frame_idx=frame_count,
+                                reason="SERIAL_TX_FAIL",
+                                yaw_rad=bridge_result.yaw_accum_rad,
+                                pitch_rad=bridge_result.pitch_accum_rad,
+                            )
                         else:
-                            if speed_recovery_counter > 0:
-                                speed_recovery_counter -= 1
-                                current_speed = base_auto_speed * 0.4  
+                            # [状态机]: 动态降速逻辑与冷却保护
+                            base_auto_speed = MANUAL_MOVE_SPEED * 0.85
+
+                            if total_norm_error > 0.18:
+                                speed_trigger_counter += 1
                             else:
-                                current_speed = base_auto_speed
-                                if is_slowing_down:
-                                    print(f">>> [限速解除] 误差回落且冷却期结束 | 推进速度恢复: {current_speed:.3f}")
-                                    is_slowing_down = False
-                                    
-                        local_displacement[2] -= current_speed * dt
+                                speed_trigger_counter = 0
+
+                            if speed_trigger_counter >= TRIGGER_FRAMES:
+                                current_speed = base_auto_speed * 0.4
+                                speed_recovery_counter = RECOVERY_FRAMES
+                                if not is_slowing_down:
+                                    # 移除开头的 \\n，使日志输出紧凑整齐
+                                    print(f">>> [限速触发] 连续 {TRIGGER_FRAMES} 帧确认高曲率 | 推进速度降至: {current_speed:.3f}")
+                                    is_slowing_down = True
+                            else:
+                                if speed_recovery_counter > 0:
+                                    speed_recovery_counter -= 1
+                                    current_speed = base_auto_speed * 0.4
+                                else:
+                                    current_speed = base_auto_speed
+                                    if is_slowing_down:
+                                        print(f">>> [限速解除] 误差回落且冷却期结束 | 推进速度恢复: {current_speed:.3f}")
+                                        is_slowing_down = False
+
+                            local_displacement[2] -= current_speed * dt
                 else:
                     if is_slowing_down:
                         is_slowing_down = False
@@ -556,7 +606,12 @@ try:
             
             time.sleep(max(0, dt - (time.time() - step_start)))
 
+except KeyboardInterrupt:
+    print("\n>>> [Sim2Real] 检测到 Ctrl+C，正在下发全轴急停并退出...")
+    request_shutdown_estop("Ctrl+C")
+
 finally:
+    request_shutdown_estop("程序退出")
     listener.stop()
     if serial_link is not None:
         serial_link.close()

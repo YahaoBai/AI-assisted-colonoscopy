@@ -1,13 +1,13 @@
 sim2real:
   # 4x2 映射矩阵：[delta_yaw, delta_pitch] (rad/step) -> 4 个电机位移变化量 (mm/step)
   # 列定义：第 1 列 = 偏航 yaw；第 2 列 = 俯仰 pitch。
-  # bridge 内部会把变化量累加为“电机绝对位移目标”。
+  # bridge 内部会把变化量累加为“电机绝对位移目标(mm)”。
   # 上机前请替换为你的实机标定矩阵。
   J_4x2_mm_per_rad:
-    - [2.5, 0.0]
-    - [-2.5, 0.0]
-    - [0.0, 2.5]
-    - [0.0, -2.5]
+    - [4.0, 0.0]
+    - [0.0, 4.0]
+    - [-4.0, 0.0]
+    - [0.0, -4.0]
 
   # 基于“指令累计角”的单轴限位
   yaw_limit_deg: 150.0
@@ -16,20 +16,68 @@ sim2real:
   # 电机绝对位移目标硬限幅（单位 mm，实际限位区间为 [-motor_limit_mm, +motor_limit_mm]）
   motor_limit_mm: 15.0
 
-  # 串口下发频率（Hz）。仿真可高频运行，bridge 会按该频率节流下发 CMD。
+  # 串口下发频率（Hz）。仿真可高频运行，bridge 会按该频率节流下发。
   control_hz: 30.0
 
-  # CMD 下发通道顺序（J 的行默认按 m1,m2,m3,m4 解释；这里用于重排到硬件通道顺序）
+  # 下发通道顺序（J 的行默认按 m1,m2,m3,m4 解释；这里用于重排到硬件通道顺序）
   motor_order: ["m1", "m2", "m3", "m4"]
 
   serial:
-    port: "/dev/pts/3"
+    port: "/dev/ttyUSB0"
     baudrate: 115200
     timeout: 0.0
-    # 关键控制帧（ESTOP/RESET）最少重发次数
+    # 串口写超时（秒），避免链路异常时 write() 长时间阻塞
+    write_timeout: 0.2
+    # 关键控制帧（ESTOP/WORK_START/FOLLOW_ZERO）最少重发次数
     critical_retry_count: 3
     # 关键控制帧重发间隔（秒）
     critical_retry_interval_sec: 0.02
+
+  # LA 电缸实机发送配置（Python直连串口）
+  actuator:
+    # 当前阶段固定为广播随动无反馈（手册指令值 0xF3）
+    mode: broadcast_follow_no_feedback
+    # 4 个物理电缸 ID（语义顺序固定为 m1,m2,m3,m4）
+    ids: [1, 2, 3, 4]
+    # 显式语义映射（语义电机 -> 物理ID），启动时会与 ids 做一致性校验
+    id_by_motor:
+      m1: 1
+      m2: 2
+      m3: 3
+      m4: 4
+    # 目标位置控制表索引（单机模式使用，广播随动阶段保留该配置用于兼容）
+    position_index: 0x37
+    # 电缸位置硬范围（手册典型范围 0~2000）
+    count_min: 0
+    count_max: 2000
+    # 每个“语义电机”的 mm->count 线性映射
+    # count = zero_count + sign * mm * count_per_mm，再经 soft/hard 双重裁剪。
+    # 若 LA50 的全行程约 50mm 且位置计数范围为 0~2000，则理论 count_per_mm ≈ 40。
+    per_motor:
+      m1:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+      m2:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+      m3:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+      m4:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
 
   # ESTOP 锁存后的终端报警行为
   alarm:
