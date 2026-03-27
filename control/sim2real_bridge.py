@@ -4,10 +4,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 import math
 from pathlib import Path
+import threading
 import time
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+
+_SERIAL_TIMEOUT_UNSET = object()
 
 DEFAULT_J_4X2_MM_PER_RAD = np.array(
     [
@@ -94,6 +97,28 @@ class MotorOutputConfig:
         self.print_every_n = max(0, int(self.print_every_n))
         self.plot_dpi = max(60, int(self.plot_dpi))
         self.max_plot_points = max(200, int(self.max_plot_points))
+
+
+@dataclass
+class MonitorConfig:
+    enabled: bool = True
+    query_hz: float = 20.0
+    response_timeout_sec: float = 0.02
+    failure_threshold: int = 3
+    error_mask: int = 0x0F
+    log_every_n: int = 5
+
+    def __post_init__(self) -> None:
+        self.query_hz = float(self.query_hz)
+        self.response_timeout_sec = float(self.response_timeout_sec)
+        self.failure_threshold = max(1, int(self.failure_threshold))
+        self.error_mask = int(self.error_mask) & 0xFF
+        self.log_every_n = max(0, int(self.log_every_n))
+
+        if self.query_hz <= 0.0:
+            raise ValueError("monitor.query_hz must be > 0")
+        if self.response_timeout_sec <= 0.0:
+            raise ValueError("monitor.response_timeout_sec must be > 0")
 
 
 @dataclass
@@ -210,6 +235,7 @@ class DaggerSim2RealRuntimeConfig:
     bridge: Sim2RealConfig
     actuator: ActuatorConfig
     alarm: EstopAlarmConfig
+    monitor: MonitorConfig
     output: MotorOutputConfig
 
 
@@ -223,6 +249,35 @@ class BridgeResult:
     yaw_accum_rad: float = 0.0
     pitch_accum_rad: float = 0.0
     reason: str = ""
+
+
+@dataclass
+class ActuatorStatus:
+    actuator_id: int
+    target_count: int
+    current_count: int
+    temperature_c: int
+    error_bits: int
+    raw_frame: bytes
+    timestamp_sec: float
+
+
+@dataclass
+class MonitorFault:
+    reason: str
+    actuator_id: int
+    consecutive_failures: int
+    raw: bytes = b""
+    error_bits: int = 0
+    timestamp_sec: float = 0.0
+
+
+@dataclass
+class FaultClearVerification:
+    ok: bool
+    statuses_by_id: Dict[int, ActuatorStatus] = field(default_factory=dict)
+    failures_by_id: Dict[int, str] = field(default_factory=dict)
+    uncleared_error_bits_by_id: Dict[int, int] = field(default_factory=dict)
 
 
 class Sim2RealBridge:
@@ -324,6 +379,15 @@ class LAFrameBuilder:
         return bytes([0x55, 0xAA] + body + [LAFrameBuilder.checksum(body)])
 
     @staticmethod
+    def build_status_query_frame(actuator_id: int) -> bytes:
+        aid = int(actuator_id)
+        if not (1 <= aid <= 254):
+            raise ValueError(f"actuator_id out of range [1,254]: {aid}")
+
+        body = [0x03, aid, 0x04, 0x00, 0x22]
+        return bytes([0x55, 0xAA] + body + [LAFrameBuilder.checksum(body)])
+
+    @staticmethod
     def build_follow_broadcast_frame(actuator_ids: Sequence[int], target_counts: Sequence[int]) -> bytes:
         if len(actuator_ids) != len(target_counts):
             raise ValueError("actuator_ids and target_counts length mismatch")
@@ -382,13 +446,15 @@ class ActuatorTx:
         critical_retry_count: int = 3,
         critical_retry_interval_sec: float = 0.02,
         print_tx_frame: bool = False,
+        serial_lock: Optional[threading.Lock] = None,
     ) -> None:
         self.serial_link = serial_link
         self.critical_retry_count = max(1, int(critical_retry_count))
         self.critical_retry_interval_sec = max(0.0, float(critical_retry_interval_sec))
         self.print_tx_frame = bool(print_tx_frame)
+        self.serial_lock = serial_lock if serial_lock is not None else threading.Lock()
 
-    def send_frame(self, frame: bytes, frame_name: str = "FRAME") -> bool:
+    def _send_frame_locked(self, frame: bytes, frame_name: str = "FRAME") -> bool:
         if self.serial_link is None:
             print(f"❌ [ActuatorTx] 串口链路未就绪，拒绝发送 {frame_name}。")
             return False
@@ -411,17 +477,22 @@ class ActuatorTx:
             print(f"[ActuatorTx TX] {frame_name}: {payload.hex(' ').upper()}")
         return True
 
+    def send_frame(self, frame: bytes, frame_name: str = "FRAME") -> bool:
+        with self.serial_lock:
+            return self._send_frame_locked(frame, frame_name)
+
     def send_critical(self, frames: Sequence[bytes], frame_name: str) -> bool:
         frame_seq = [bytes(x) for x in frames]
         if len(frame_seq) == 0:
             return True
 
         for attempt in range(1, self.critical_retry_count + 1):
-            ok = True
-            for idx, frame in enumerate(frame_seq):
-                if not self.send_frame(frame, f"{frame_name}[{idx}]"):
-                    ok = False
-                    break
+            with self.serial_lock:
+                ok = True
+                for idx, frame in enumerate(frame_seq):
+                    if not self._send_frame_locked(frame, f"{frame_name}[{idx}]"):
+                        ok = False
+                        break
             if ok:
                 if attempt > 1:
                     print(f"✅ [ActuatorTx] 关键帧 {frame_name} 在第 {attempt} 次重发后成功。")
@@ -466,6 +537,473 @@ class ActuatorTx:
             ok = self.send_frame(frame, f"WORK_START[{idx}]") and ok
         return ok
 
+    def send_fault_clear_all(self, actuator_ids: Sequence[int], critical: bool = True) -> bool:
+        frames = [LAFrameBuilder.build_single_control_frame(aid, 0x1E) for aid in actuator_ids]
+        if critical:
+            return self.send_critical(frames, "FAULT_CLEAR_ALL")
+        ok = True
+        for idx, frame in enumerate(frames):
+            ok = self.send_frame(frame, f"FAULT_CLEAR[{idx}]") and ok
+        return ok
+
+
+class LAFrameParser:
+    RESPONSE_HEADER = b"\xAA\x55"
+
+    @staticmethod
+    def extract_first_response_frame(payload: bytes) -> Optional[bytes]:
+        frame, _ = LAFrameParser.extract_first_response_frame_with_consumed(payload)
+        return frame
+
+    @staticmethod
+    def extract_first_response_frame_with_consumed(payload: bytes) -> Tuple[Optional[bytes], int]:
+        data = bytes(payload)
+        data_len = len(data)
+        if data_len < 2:
+            return None, 0
+
+        idx = 0
+        while idx + 1 < data_len:
+            if data[idx] != 0xAA or data[idx + 1] != 0x55:
+                idx += 1
+                continue
+
+            if idx + 3 >= data_len:
+                return None, idx
+
+            frame_len = int(data[idx + 2])
+            total_len = frame_len + 5
+            if total_len < 7:
+                idx += 1
+                continue
+            if idx + total_len <= data_len:
+                end = idx + total_len
+                return data[idx:end], end
+            return None, idx
+
+        return None, max(0, data_len - 1)
+
+    @staticmethod
+    def parse_status_response(frame: bytes, expected_id: Optional[int] = None) -> ActuatorStatus:
+        payload = bytes(frame)
+        if len(payload) < 7:
+            raise ValueError("response frame too short")
+        if payload[0:2] != LAFrameParser.RESPONSE_HEADER:
+            raise ValueError("invalid response header")
+
+        frame_len = int(payload[2])
+        expected_total = frame_len + 5
+        if len(payload) != expected_total:
+            raise ValueError(f"response length mismatch: got {len(payload)} expected {expected_total}")
+
+        body = payload[2:-1]
+        checksum = int(payload[-1])
+        checksum_calc = LAFrameBuilder.checksum(body)
+        if checksum != checksum_calc:
+            raise ValueError(f"invalid checksum: got {checksum} expected {checksum_calc}")
+
+        actuator_id = int(payload[3])
+        if expected_id is not None and actuator_id != int(expected_id):
+            raise ValueError(f"id mismatch: got {actuator_id} expected {int(expected_id)}")
+
+        cmd = int(payload[4])
+        reserved = int(payload[5])
+        index = int(payload[6])
+        if cmd != 0x04:
+            raise ValueError(f"unexpected response cmd: {cmd}")
+        if reserved != 0x00:
+            raise ValueError(f"unexpected response reserved byte: {reserved}")
+        if index != 0x22:
+            raise ValueError(f"unexpected response index: {index}")
+
+        # For 0x22 replies, the manual defines:
+        # B7~B8 target, B9~B10 current, B11 temp, B12~B13 current,
+        # B14 force low, B15 error, B16 force high, B17~B20 internal data.
+        data = payload[7:-1]
+        if len(data) < 14:
+            raise ValueError("status response data too short")
+
+        target_count = int(data[0]) | (int(data[1]) << 8)
+        current_count = int.from_bytes(data[2:4], byteorder="little", signed=True)
+        temperature_c = int.from_bytes(bytes([int(data[4])]), byteorder="little", signed=True)
+        error_bits = int(data[8]) & 0xFF
+
+        return ActuatorStatus(
+            actuator_id=actuator_id,
+            target_count=target_count,
+            current_count=current_count,
+            temperature_c=temperature_c,
+            error_bits=error_bits,
+            raw_frame=payload,
+            timestamp_sec=time.time(),
+        )
+
+
+class ActuatorMonitor:
+    def __init__(
+        self,
+        serial_link: Any,
+        actuator_ids: Sequence[int],
+        monitor_cfg: MonitorConfig,
+        serial_lock: Optional[threading.Lock] = None,
+    ) -> None:
+        ids = tuple(int(x) for x in actuator_ids)
+        if len(ids) == 0:
+            raise ValueError("actuator_ids must not be empty")
+        for aid in ids:
+            if not (1 <= aid <= 254):
+                raise ValueError(f"actuator id out of range [1,254]: {aid}")
+
+        self.serial_link = serial_link
+        self.actuator_ids = ids
+        self.monitor_cfg = monitor_cfg
+        self.serial_lock = serial_lock if serial_lock is not None else threading.Lock()
+
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._active_event = threading.Event()
+        self._fault_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        self._rr_index = 0
+        self._poll_count = 0
+        self._consecutive_failures_by_id: Dict[int, int] = {
+            aid: 0 for aid in self.actuator_ids
+        }
+        self._last_status: Dict[int, ActuatorStatus] = {}
+        self._last_fault: Optional[MonitorFault] = None
+
+    def start(self) -> None:
+        if not self.monitor_cfg.enabled:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="sim2real-actuator-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, join_timeout_sec: float = 1.0) -> None:
+        self._stop_event.set()
+        self._active_event.clear()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, float(join_timeout_sec)))
+
+    def set_active(self, active: bool) -> None:
+        if not self.monitor_cfg.enabled:
+            return
+        if bool(active):
+            self._active_event.set()
+        else:
+            was_active = self._active_event.is_set()
+            self._active_event.clear()
+            if was_active:
+                with self._state_lock:
+                    self._reset_failure_streaks_locked()
+
+    def _reset_failure_streaks_locked(self) -> None:
+        for aid in self._consecutive_failures_by_id:
+            self._consecutive_failures_by_id[aid] = 0
+
+    def clear_fault(self) -> None:
+        with self._state_lock:
+            self._fault_event.clear()
+            self._last_fault = None
+            self._reset_failure_streaks_locked()
+
+    def verify_fault_clear(
+        self,
+        actuator_ids: Optional[Sequence[int]] = None,
+        attempts: int = 2,
+        settle_time_sec: float = 0.01,
+        error_mask: Optional[int] = None,
+    ) -> FaultClearVerification:
+        if not self.monitor_cfg.enabled:
+            return FaultClearVerification(ok=True)
+
+        ids = tuple(self.actuator_ids if actuator_ids is None else actuator_ids)
+        if len(ids) == 0:
+            return FaultClearVerification(ok=True)
+
+        max_attempts = max(1, int(attempts))
+        settle_sec = max(0.0, float(settle_time_sec))
+        mask = (
+            self.monitor_cfg.error_mask if error_mask is None else (int(error_mask) & 0xFF)
+        )
+
+        last_statuses: Dict[int, ActuatorStatus] = {}
+        last_failures: Dict[int, str] = {}
+        last_uncleared: Dict[int, int] = {}
+
+        for attempt_idx in range(max_attempts):
+            last_statuses = {}
+            last_failures = {}
+            last_uncleared = {}
+
+            for actuator_id in ids:
+                ok, status, reason, _ = self._query_once(int(actuator_id))
+                if not ok or status is None:
+                    last_failures[int(actuator_id)] = str(reason)
+                    continue
+
+                last_statuses[status.actuator_id] = status
+                with self._state_lock:
+                    self._last_status[status.actuator_id] = status
+
+                if (status.error_bits & mask) != 0:
+                    last_uncleared[status.actuator_id] = status.error_bits
+
+            if not last_failures and not last_uncleared:
+                return FaultClearVerification(
+                    ok=True,
+                    statuses_by_id=last_statuses,
+                )
+
+            if attempt_idx + 1 < max_attempts and settle_sec > 0.0:
+                time.sleep(settle_sec)
+
+        return FaultClearVerification(
+            ok=False,
+            statuses_by_id=last_statuses,
+            failures_by_id=last_failures,
+            uncleared_error_bits_by_id=last_uncleared,
+        )
+
+    def has_fault(self) -> bool:
+        return self._fault_event.is_set()
+
+    def get_fault(self) -> Optional[MonitorFault]:
+        with self._state_lock:
+            return self._last_fault
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._state_lock:
+            return {
+                "poll_count": int(self._poll_count),
+                "consecutive_failures": max(self._consecutive_failures_by_id.values(), default=0),
+                "consecutive_failures_by_id": dict(self._consecutive_failures_by_id),
+                "fault": self._last_fault,
+                "last_status": {k: v for k, v in self._last_status.items()},
+            }
+
+    def _make_round_summary_line_locked(self) -> Optional[str]:
+        num_axes = len(self.actuator_ids)
+        if num_axes <= 0:
+            return None
+
+        log_every_n = self.monitor_cfg.log_every_n
+        if log_every_n <= 0:
+            return None
+        if self._poll_count <= 0 or (self._poll_count % num_axes) != 0:
+            return None
+
+        round_count = self._poll_count // num_axes
+        if round_count <= 0 or (round_count % log_every_n) != 0:
+            return None
+
+        parts = []
+        for actuator_id in self.actuator_ids:
+            failures = self._consecutive_failures_by_id.get(actuator_id, 0)
+            status = self._last_status.get(actuator_id)
+            if status is None:
+                parts.append(f"id={actuator_id} NO_DATA fail={failures}")
+                continue
+
+            if failures > 0:
+                parts.append(
+                    f"id={actuator_id} fail={failures} "
+                    f"last_tgt={status.target_count} last_cur={status.current_count} "
+                    f"temp={status.temperature_c}C err=0x{status.error_bits:02X}"
+                )
+            else:
+                parts.append(
+                    f"id={actuator_id} tgt={status.target_count} cur={status.current_count} "
+                    f"temp={status.temperature_c}C err=0x{status.error_bits:02X}"
+                )
+
+        return f"[Monitor] round={round_count} poll={self._poll_count} | " + " | ".join(parts)
+
+    def _run_loop(self) -> None:
+        period_sec = 1.0 / self.monitor_cfg.query_hz
+        idle_sleep_sec = min(0.02, period_sec)
+
+        while not self._stop_event.is_set():
+            if not self._active_event.is_set():
+                time.sleep(idle_sleep_sec)
+                continue
+
+            tick_start = time.monotonic()
+            actuator_id = self.actuator_ids[self._rr_index]
+            self._rr_index = (self._rr_index + 1) % len(self.actuator_ids)
+
+            ok, status, reason, raw = self._query_once(actuator_id)
+
+            if not self._active_event.is_set():
+                with self._state_lock:
+                    self._reset_failure_streaks_locked()
+                continue
+
+            if ok and status is not None:
+                self._record_success(status)
+                if (status.error_bits & self.monitor_cfg.error_mask) != 0:
+                    self._raise_fault(
+                        reason="ACTUATOR_ERROR_BITS",
+                        actuator_id=status.actuator_id,
+                        consecutive_failures=self._consecutive_failures_by_id.get(
+                            status.actuator_id,
+                            0,
+                        ),
+                        raw=status.raw_frame,
+                        error_bits=status.error_bits,
+                    )
+            else:
+                self._record_failure(reason=reason, actuator_id=actuator_id, raw=raw)
+
+            elapsed = time.monotonic() - tick_start
+            remain = period_sec - elapsed
+            if remain > 0.0:
+                time.sleep(remain)
+
+    def _record_success(self, status: ActuatorStatus) -> None:
+        summary_line = None
+        with self._state_lock:
+            self._poll_count += 1
+            self._last_status[status.actuator_id] = status
+            self._consecutive_failures_by_id[status.actuator_id] = 0
+            summary_line = self._make_round_summary_line_locked()
+
+        if summary_line is not None:
+            print(summary_line)
+
+    def _record_failure(self, reason: str, actuator_id: int, raw: bytes) -> None:
+        summary_line = None
+        with self._state_lock:
+            self._poll_count += 1
+            self._consecutive_failures_by_id[actuator_id] += 1
+            failures = self._consecutive_failures_by_id[actuator_id]
+            summary_line = self._make_round_summary_line_locked()
+
+        if summary_line is not None:
+            print(summary_line)
+
+        if failures >= self.monitor_cfg.failure_threshold:
+            self._raise_fault(
+                reason=reason,
+                actuator_id=actuator_id,
+                consecutive_failures=failures,
+                raw=raw,
+            )
+
+    def _raise_fault(
+        self,
+        reason: str,
+        actuator_id: int,
+        consecutive_failures: int,
+        raw: bytes = b"",
+        error_bits: int = 0,
+    ) -> None:
+        with self._state_lock:
+            if self._fault_event.is_set():
+                return
+            self._last_fault = MonitorFault(
+                reason=str(reason),
+                actuator_id=int(actuator_id),
+                consecutive_failures=int(consecutive_failures),
+                raw=bytes(raw),
+                error_bits=int(error_bits) & 0xFF,
+                timestamp_sec=time.time(),
+            )
+            self._fault_event.set()
+
+    def _query_once(self, actuator_id: int) -> Tuple[bool, Optional[ActuatorStatus], str, bytes]:
+        if self.serial_link is None or not getattr(self.serial_link, "is_open", True):
+            return False, None, "SERIAL_NOT_READY", b""
+
+        query_frame = LAFrameBuilder.build_status_query_frame(actuator_id)
+        original_timeout: Any = _SERIAL_TIMEOUT_UNSET
+        timeout_overridden = False
+
+        try:
+            with self.serial_lock:
+                original_timeout = getattr(self.serial_link, "timeout", _SERIAL_TIMEOUT_UNSET)
+                if original_timeout is not _SERIAL_TIMEOUT_UNSET and original_timeout != 0.0:
+                    self.serial_link.timeout = 0.0
+                    timeout_overridden = True
+                if hasattr(self.serial_link, "reset_input_buffer"):
+                    self.serial_link.reset_input_buffer()
+                try:
+                    bytes_written = self.serial_link.write(query_frame)
+                    if hasattr(self.serial_link, "flush"):
+                        self.serial_link.flush()
+                    if bytes_written != len(query_frame):
+                        return False, None, "SHORT_WRITE", query_frame
+
+                    status, response_frame, reason = self._read_status_response_locked(
+                        self.monitor_cfg.response_timeout_sec,
+                        expected_id=actuator_id,
+                    )
+                finally:
+                    if timeout_overridden:
+                        self.serial_link.timeout = original_timeout
+        except Exception as exc:
+            return False, None, f"SERIAL_EXCEPTION:{exc}", b""
+
+        if status is None:
+            return False, None, reason, response_frame
+
+        return True, status, "OK", response_frame
+
+    def _read_status_response_locked(
+        self,
+        timeout_sec: float,
+        expected_id: Optional[int] = None,
+    ) -> Tuple[Optional[ActuatorStatus], bytes, str]:
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        recv = bytearray()
+        last_parse_error_reason: Optional[str] = None
+        last_parse_error_frame = b""
+
+        while time.monotonic() < deadline:
+            read_size = 1
+            try:
+                in_waiting = int(getattr(self.serial_link, "in_waiting", 0))
+            except Exception:
+                in_waiting = 0
+            if in_waiting > 0:
+                read_size = min(256, in_waiting)
+
+            chunk = self.serial_link.read(read_size)
+            if chunk:
+                recv.extend(chunk)
+                while True:
+                    frame, consumed = LAFrameParser.extract_first_response_frame_with_consumed(
+                        bytes(recv)
+                    )
+                    if consumed > 0:
+                        del recv[:consumed]
+                    if frame is None:
+                        break
+
+                    try:
+                        status = LAFrameParser.parse_status_response(frame)
+                    except Exception as exc:
+                        last_parse_error_reason = f"PARSE_ERROR:{exc}"
+                        last_parse_error_frame = frame
+                        continue
+
+                    if expected_id is not None and status.actuator_id != int(expected_id):
+                        continue
+                    return status, frame, "OK"
+            else:
+                time.sleep(0.001)
+        if last_parse_error_reason is not None:
+            return None, last_parse_error_frame, last_parse_error_reason
+        return None, b"", "READ_TIMEOUT"
+
 
 def default_dagger_sim2real_runtime_config() -> DaggerSim2RealRuntimeConfig:
     bridge_cfg = Sim2RealConfig(
@@ -500,6 +1038,14 @@ def default_dagger_sim2real_runtime_config() -> DaggerSim2RealRuntimeConfig:
         terminal_bell=True,
         banner_width=70,
     )
+    monitor_cfg = MonitorConfig(
+        enabled=True,
+        query_hz=20.0,
+        response_timeout_sec=0.02,
+        failure_threshold=3,
+        error_mask=0x0F,
+        log_every_n=5,
+    )
     output_cfg = MotorOutputConfig(
         print_tx_frame=False,
         print_every_n=100,
@@ -514,6 +1060,7 @@ def default_dagger_sim2real_runtime_config() -> DaggerSim2RealRuntimeConfig:
         bridge=bridge_cfg,
         actuator=actuator_cfg,
         alarm=alarm_cfg,
+        monitor=monitor_cfg,
         output=output_cfg,
     )
 
@@ -558,6 +1105,12 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
         output_raw = {}
     if not isinstance(output_raw, Mapping):
         raise ValueError("`sim2real.output` must be a mapping/object.")
+
+    monitor_raw = sim2real_raw.get("monitor", {})
+    if monitor_raw is None:
+        monitor_raw = {}
+    if not isinstance(monitor_raw, Mapping):
+        raise ValueError("`sim2real.monitor` must be a mapping/object.")
 
     actuator_raw = sim2real_raw.get("actuator", None)
     if actuator_raw is None:
@@ -628,6 +1181,19 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
         banner_width=int(alarm_raw.get("banner_width", defaults.alarm.banner_width)),
     )
 
+    monitor_cfg = MonitorConfig(
+        enabled=bool(monitor_raw.get("enabled", defaults.monitor.enabled)),
+        query_hz=float(monitor_raw.get("query_hz", defaults.monitor.query_hz)),
+        response_timeout_sec=float(
+            monitor_raw.get("response_timeout_sec", defaults.monitor.response_timeout_sec)
+        ),
+        failure_threshold=int(
+            monitor_raw.get("failure_threshold", defaults.monitor.failure_threshold)
+        ),
+        error_mask=_coerce_int(monitor_raw.get("error_mask", defaults.monitor.error_mask)),
+        log_every_n=int(monitor_raw.get("log_every_n", defaults.monitor.log_every_n)),
+    )
+
     output_cfg = MotorOutputConfig(
         print_tx_frame=bool(output_raw.get("print_tx_frame", defaults.output.print_tx_frame)),
         print_every_n=int(output_raw.get("print_every_n", defaults.output.print_every_n)),
@@ -643,6 +1209,7 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
         bridge=bridge_cfg,
         actuator=actuator_cfg,
         alarm=alarm_cfg,
+        monitor=monitor_cfg,
         output=output_cfg,
     )
 

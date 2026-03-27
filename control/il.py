@@ -34,6 +34,7 @@ except ImportError as e:
     exit()
 
 from control.sim2real_bridge import (
+    ActuatorMonitor,
     ActuatorTx,
     BridgeCommand,
     DaggerSim2RealRuntimeConfig,
@@ -151,6 +152,7 @@ except Exception as e:
 sim2real_cfg = runtime_cfg.bridge
 actuator_cfg = runtime_cfg.actuator
 estop_alarm_cfg = runtime_cfg.alarm
+monitor_cfg = runtime_cfg.monitor
 motor_output_cfg = runtime_cfg.output
 sim2real_bridge = Sim2RealBridge(sim2real_cfg)
 motor_mapper = MotorMapper(actuator_cfg, sim2real_cfg.motor_order)
@@ -187,21 +189,65 @@ actuator_tx = ActuatorTx(
     critical_retry_interval_sec=sim2real_cfg.serial_critical_retry_interval_sec,
     print_tx_frame=motor_output_cfg.print_tx_frame,
 )
+actuator_monitor = ActuatorMonitor(
+    serial_link=serial_link,
+    actuator_ids=actuator_ids,
+    monitor_cfg=monitor_cfg,
+    serial_lock=actuator_tx.serial_lock,
+)
+actuator_monitor.start()
+if monitor_cfg.enabled:
+    print(
+        f">>> 监测线程已启动: query_hz={monitor_cfg.query_hz:.1f}Hz "
+        f"timeout={monitor_cfg.response_timeout_sec:.3f}s "
+        f"failure_threshold={monitor_cfg.failure_threshold}"
+    )
+else:
+    print(">>> 监测线程已禁用（sim2real.monitor.enabled=false）。")
+
+
+FOLLOW_TX_LOG_EVERY_N = 30
+follow_tx_log_count = 0
 
 
 def send_follow_target_mm(motor_target_mm: np.ndarray, frame_name: str = "F3_FOLLOW", critical: bool = False) -> bool:
+    global follow_tx_log_count
+
     try:
         target_counts = motor_mapper.mm_targets_to_counts(motor_target_mm)
     except Exception as e:
         print(f"⚠️ [Sim2Real] mm->count 映射失败: {e}")
         return False
 
-    return actuator_tx.send_follow_broadcast(
+    send_ok = actuator_tx.send_follow_broadcast(
         actuator_ids,
         target_counts.tolist(),
         critical=critical,
         frame_name=frame_name,
     )
+    if send_ok:
+        should_log = critical or frame_name != "F3_FOLLOW"
+        if not should_log:
+            follow_tx_log_count += 1
+            should_log = (follow_tx_log_count % FOLLOW_TX_LOG_EVERY_N) == 0
+
+        if should_log:
+            count_text = " ".join(
+                f"{motor}(id={aid})={count}"
+                for motor, aid, count in zip(
+                    sim2real_cfg.motor_order,
+                    actuator_ids,
+                    target_counts.tolist(),
+                )
+            )
+            if critical or frame_name != "F3_FOLLOW":
+                print(f"[Sim2Real TX] {frame_name} counts | {count_text}")
+            else:
+                print(
+                    f"[Sim2Real TX] {frame_name} counts "
+                    f"(every {FOLLOW_TX_LOG_EVERY_N} sends, seq={follow_tx_log_count}) | {count_text}"
+                )
+    return send_ok
 
 
 def send_estop_all_critical() -> bool:
@@ -210,6 +256,10 @@ def send_estop_all_critical() -> bool:
 
 def send_work_start_all_critical() -> bool:
     return actuator_tx.send_work_start_all(actuator_ids, critical=True)
+
+
+def send_fault_clear_all_critical() -> bool:
+    return actuator_tx.send_fault_clear_all(actuator_ids, critical=True)
 
 
 shutdown_estop_done = False
@@ -412,28 +462,108 @@ try:
                 if not sim2real_bridge.estop_latched:
                     print(">>> [Sim2Real] 当前未处于急停锁存，已忽略 [R]，避免误触发工作启动/回零。")
                 else:
-                    sim2real_bridge.reset()
-                    work_start_ok = send_work_start_all_critical()
-                    zero_ok = send_follow_target_mm(
-                        np.zeros(4, dtype=np.float64),
-                        frame_name="F3_FOLLOW_ZERO",
-                        critical=True,
+                    actuator_monitor.set_active(False)
+                    key_states['autopilot_on'] = False
+                    fault_clear_ok = send_fault_clear_all_critical()
+                    work_start_ok = fault_clear_ok and send_work_start_all_critical()
+                    zero_ok = (
+                        work_start_ok
+                        and send_follow_target_mm(
+                            np.zeros(4, dtype=np.float64),
+                            frame_name="F3_FOLLOW_ZERO",
+                            critical=True,
+                        )
                     )
+                    verify_result = None
+                    if fault_clear_ok and work_start_ok and zero_ok:
+                        verify_result = actuator_monitor.verify_fault_clear(
+                            actuator_ids=actuator_ids,
+                            attempts=2,
+                            settle_time_sec=max(0.01, monitor_cfg.response_timeout_sec),
+                        )
 
-                    if work_start_ok and zero_ok:
-                        print(">>> [Sim2Real] 已清除急停锁存，累计角归零并下发零位。")
+                    if (
+                        fault_clear_ok
+                        and work_start_ok
+                        and zero_ok
+                        and verify_result is not None
+                        and verify_result.ok
+                    ):
+                        sim2real_bridge.reset()
+                        actuator_monitor.clear_fault()
+                        print(">>> [Sim2Real] 已清除电缸故障/急停锁存，累计角归零并下发零位。")
                     else:
                         sim2real_bridge.estop_latched = True
                         key_states['autopilot_on'] = False
-                        print("❌ [Sim2Real] RESET/回零下发失败，已保持锁存。请检查串口后按 [R] 重试。")
+                        detail_parts = []
+                        if verify_result is not None:
+                            if verify_result.failures_by_id:
+                                detail_parts.append(
+                                    "状态复查失败: "
+                                    + ", ".join(
+                                        f"id={aid}:{reason}"
+                                        for aid, reason in sorted(verify_result.failures_by_id.items())
+                                    )
+                                )
+                            if verify_result.uncleared_error_bits_by_id:
+                                detail_parts.append(
+                                    "故障位仍存在: "
+                                    + ", ".join(
+                                        f"id={aid}:0x{bits:02X}"
+                                        for aid, bits in sorted(
+                                            verify_result.uncleared_error_bits_by_id.items()
+                                        )
+                                    )
+                                    + "，可能仍处于过温等硬件保护状态"
+                                )
+
+                        detail_suffix = ""
+                        if detail_parts:
+                            detail_suffix = " " + "；".join(detail_parts)
+
+                        print(
+                            "❌ [Sim2Real] 故障清除/RESET/回零未完成，已保持锁存。"
+                            f"{detail_suffix} 请检查硬件状态后按 [R] 重试。"
+                        )
 
             if sim2real_bridge.estop_latched and key_states['autopilot_on']:
                 key_states['autopilot_on'] = False
                 print(">>> [Sim2Real] 角度急停已锁存，自动模式被禁止。请按 [R] 复位。")
 
+            monitor_active = key_states['autopilot_on'] and (not sim2real_bridge.estop_latched)
+            actuator_monitor.set_active(monitor_active)
+
             step_pitch = 0.0
             step_yaw = 0.0
             local_displacement = np.zeros(3)
+
+            monitor_fault = actuator_monitor.get_fault() if actuator_monitor.has_fault() else None
+            if monitor_fault is not None and not sim2real_bridge.estop_latched:
+                sim2real_bridge.estop_latched = True
+                key_states['autopilot_on'] = False
+                actuator_monitor.set_active(False)
+                is_slowing_down = False
+                speed_trigger_counter = 0
+                speed_recovery_counter = 0
+                step_yaw = 0.0
+                step_pitch = 0.0
+                local_displacement[2] = 0.0
+
+                estop_tx_ok = send_estop_all_critical()
+                if not estop_tx_ok:
+                    print("❌ [Sim2Real] 监测故障触发后 ESTOP 下发失败，请立即人工确认硬件急停。")
+
+                emit_estop_alarm(
+                    frame_idx=frame_count,
+                    reason=f"MONITOR_{monitor_fault.reason}",
+                    yaw_rad=sim2real_bridge.yaw_accum_rad,
+                    pitch_rad=sim2real_bridge.pitch_accum_rad,
+                )
+                print(
+                    f"[{frame_count}] 🛑 [Sim2Real] 监测线程触发急停锁存 | "
+                    f"reason={monitor_fault.reason} id={monitor_fault.actuator_id} "
+                    f"fails={monitor_fault.consecutive_failures} err_bits=0x{monitor_fault.error_bits:02X} | 按 [R] 复位"
+                )
 
             # 1. 渲染物理世界
             renderer.update_scene(data, camera="endoscope_cam")
@@ -482,6 +612,7 @@ try:
                     bridge_result = sim2real_bridge.step(step_yaw, step_pitch, dt)
 
                     if bridge_result.command == BridgeCommand.ESTOP:
+                        actuator_monitor.set_active(False)
                         estop_tx_ok = send_estop_all_critical()
                         if not estop_tx_ok:
                             print("❌ [Sim2Real] ESTOP 下发失败，请立即人工确认底层处于安全状态。")
@@ -518,6 +649,7 @@ try:
                             print("❌ [Sim2Real] 广播随动帧下发失败，立即锁存并急停。")
                             sim2real_bridge.estop_latched = True
                             key_states['autopilot_on'] = False
+                            actuator_monitor.set_active(False)
                             send_estop_all_critical()
                             is_slowing_down = False
                             speed_trigger_counter = 0
@@ -608,9 +740,13 @@ try:
 
 except KeyboardInterrupt:
     print("\n>>> [Sim2Real] 检测到 Ctrl+C，正在下发全轴急停并退出...")
+    actuator_monitor.set_active(False)
+    actuator_monitor.stop(join_timeout_sec=1.0)
     request_shutdown_estop("Ctrl+C")
 
 finally:
+    actuator_monitor.set_active(False)
+    actuator_monitor.stop(join_timeout_sec=1.0)
     request_shutdown_estop("程序退出")
     listener.stop()
     if serial_link is not None:

@@ -86,6 +86,20 @@ sim2real:
     terminal_bell: true
     banner_width: 70
 
+  # 状态监测线程（F3 广播控制 + 0x22 单轴轮询查询）
+  monitor:
+    enabled: true
+    # 查询线程频率（Round-Robin：4 个周期覆盖 4 轴）
+    query_hz: 20.0
+    # 单次查询等待应答超时（秒）
+    response_timeout_sec: 0.02
+    # 连续通信失败达到该次数触发锁存急停
+    failure_threshold: 3
+    # 故障位掩码：bit0~bit3 分别对应堵转/过温/过流/电机异常
+    error_mask: 0x0F
+    # 每 N 轮输出一条四轴监测摘要；1 轮 = 4 个电缸各查询 1 次；0 表示关闭摘要打印
+    log_every_n: 5
+
   # 电机目标位移输出策略（避免每帧刷屏，改为记录+导出）
   output:
     # 是否逐帧打印串口发送帧（建议关闭）
