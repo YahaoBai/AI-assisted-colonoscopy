@@ -1,0 +1,10 @@
+numpy>=1.24
+mujoco>=3.1
+pynput>=1.7
+pyserial>=3.5
+PyYAML>=6.0
+Pillow>=10.0
+opencv-contrib-python>=4.8
+torch
+torchvision
+matplotlib>=3.7
