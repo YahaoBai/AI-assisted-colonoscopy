@@ -10,11 +10,11 @@ sim2real:
     - [0.0, -4.0]
 
   # 基于“指令累计角”的单轴限位
-  yaw_limit_deg: 150.0
-  pitch_limit_deg: 150.0
+  yaw_limit_deg: 140.0
+  pitch_limit_deg: 140.0
 
   # 电机绝对位移目标硬限幅（单位 mm，实际限位区间为 [-motor_limit_mm, +motor_limit_mm]）
-  motor_limit_mm: 15.0
+  motor_limit_mm: 10.0
 
   # 串口下发频率（Hz）。仿真可高频运行，bridge 会按该频率节流下发。
   control_hz: 30.0
