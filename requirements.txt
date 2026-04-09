@@ -8,3 +8,4 @@ opencv-contrib-python>=4.8
 torch
 torchvision
 matplotlib>=3.7
+pygame>=2.5

@@ -29,3 +29,25 @@
 
 1.  **物理隔离开发：** 任何新特性的开发（如更新 U-Net 结构或微调控制参数），必须在本地创建独立分支（如 `git switch -c feat-unet-update`）。
 2.  **云端审查合并：** 本地测试通过后，将独立分支推送到 GitHub 远程仓库，并提交 Pull Request (PR)。经代码审查确认无路径冲突与接口异常后，方可合并入 `main`。
+
+## 5. 手柄遥操作入口 (Teleop)
+
+新增独立入口脚本：`control/teleop.py`（与 `control/il.py` 自动驾驶流程解耦）。
+
+### 启动方式
+
+```bash
+python -m control.teleop
+```
+
+可选参数：
+- `--dry-run`：仅验证手柄映射与安全状态机，不下发串口。
+- `--debug-input`：低频打印手柄输入快照（轴值/按钮/角速度）。
+- `--list-controllers`：扫描并列出当前识别到的手柄后退出。
+
+### 按键约定（默认）
+
+- 左摇杆：偏航/俯仰
+- `north`（DS4 `△` / Xbox `Y`）：前进占位状态（仅回调，不控制滑台）
+- `south`（DS4 `X` / Xbox `A`）长按 1s：软件急停（ESTOP latch）
+- `west`（左侧按键）长按 1s：复位序列（fault_clear -> work_start -> follow_zero）
