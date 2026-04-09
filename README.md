@@ -48,6 +48,6 @@ python -m control.teleop
 ### 按键约定（默认）
 
 - 左摇杆：偏航/俯仰
-- `north`（DS4 `△` / Xbox `Y`）：前进占位状态（仅回调，不控制滑台）
-- `south`（DS4 `X` / Xbox `A`）长按 1s：软件急停（ESTOP latch）
-- `west`（左侧按键）长按 1s：复位序列（fault_clear -> work_start -> follow_zero）
+- `Y`：前进占位状态（仅回调，不控制滑台）
+- `A`:长按 1s：软件急停（ESTOP latch）
+- `X`:（左侧按键）长按 1s：复位序列（fault_clear -> work_start -> follow_zero）
