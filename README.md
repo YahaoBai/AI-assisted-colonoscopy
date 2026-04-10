@@ -48,6 +48,30 @@ python -m control.teleop
 ### 按键约定（默认）
 
 - 左摇杆：偏航/俯仰
-- `Y`：前进占位状态（仅回调，不控制滑台）
+- `Y`：前进一步进（仅当 `sim2real.feed.teleop_enabled=true` 时生效）
 - `A`:长按 1s：软件急停（ESTOP latch）
-- `X`:（左侧按键）长按 1s：复位序列（fault_clear -> work_start -> follow_zero）
+- `X`:（左侧按键）长按 1s：复位序列（fault_clear -> work_start -> follow_zero + feed disable->enable）
+
+## 6. 进给独立硬件脚本 (Feed Axis Bring-up)
+
+为便于先独立联调进给硬件，再并入手柄总控，新增入口：`control/feed.py`。
+
+说明：
+- 本脚本使用滑台 Emm_V5 协议（RS485 链路）。
+- 与电缸 yaw/pitch 控制（UART/LA 协议）完全分离，不混用。
+
+### 启动方式
+
+```bash
+python -m control.feed
+```
+
+可选参数：
+- `--list-ports`：扫描可用串口并退出（用于确认多 USB 串口时的设备名）。
+- `--dry-run`：不下发串口，仅打印将发送的协议帧。
+
+### 交互命令
+
+- `f`：前进一次（相对模式，+step_pulses）
+- `h`：显示帮助
+- `Ctrl+C`：退出程序并自动发送失能命令

@@ -20,6 +20,15 @@ from control.sim2real_bridge import (
     Sim2RealBridge,
     load_dagger_sim2real_runtime_config,
 )
+from control.feed import (
+    FeedConfig,
+    SerialLink,
+    build_en_control_frame,
+    build_pos_control_frame,
+    compute_next_forward_target,
+    resolve_feed_config,
+    resolve_forward_dir,
+)
 from control.teleop_common import (
     HoldLatch,
     axis_to_rate,
@@ -31,6 +40,25 @@ from control.teleop_config import load_teleop_config
 from control.teleop_input import GamepadSample, PygameGamepadInput
 
 DEBUG_INPUT_HZ_DEFAULT = 5.0
+FEED_RESET_DISABLE_SETTLE_SEC = 0.15
+FEED_RESET_ENABLE_SETTLE_SEC = 0.15
+FEED_POST_RESET_PREMOVE_SETTLE_SEC = 0.10
+
+
+@dataclass
+class FeedRuntimeState:
+    """
+    Teleop 内的滑台进给运行时状态。
+    """
+
+    enabled: bool
+    cfg: Optional[FeedConfig]
+    serial_link: Optional[SerialLink]
+    current_pulses: int
+    locked: bool
+    reenable_pending: bool = False
+    next_forward_send_ts: float = 0.0
+    forward_limit_latched: bool = False
 
 
 @dataclass
@@ -47,7 +75,9 @@ class TeleopRuntimeContext:
     actuator_tx: Optional[ActuatorTx]
     actuator_monitor: Optional[ActuatorMonitor]
     monitor_settle_sec: float
+    feed_state: FeedRuntimeState
     dry_run: bool
+    allow_feed_without_actuator: bool
 
 
 @dataclass
@@ -107,6 +137,8 @@ def perform_reset_sequence(
     sim2real_bridge: Sim2RealBridge,
     monitor_settle_sec: float,
     dry_run: bool,
+    feed_state: Optional[FeedRuntimeState] = None,
+    allow_feed_without_actuator: bool = False,
 ) -> Tuple[bool, str]:
     """
     执行复位序列:
@@ -119,10 +151,21 @@ def perform_reset_sequence(
         sim2real_bridge.reset()
         if actuator_monitor is not None:
             actuator_monitor.clear_fault()
+        if feed_state is not None and feed_state.enabled:
+            feed_state.locked = False
         return True, "DRY_RUN"
 
     if actuator_tx is None:
-        return False, "NO_ACTUATOR_TX"
+        if not allow_feed_without_actuator:
+            return False, "NO_ACTUATOR_TX"
+        if feed_state is not None and feed_state.enabled:
+            feed_ok, feed_reason = _feed_reset_disable_enable(feed_state)
+            if not feed_ok:
+                return False, feed_reason
+        sim2real_bridge.reset()
+        if actuator_monitor is not None:
+            actuator_monitor.clear_fault()
+        return True, "OK_FEED_ONLY"
 
     fault_clear_ok = actuator_tx.send_fault_clear_all(actuator_ids, critical=True)
     if not fault_clear_ok:
@@ -165,6 +208,11 @@ def perform_reset_sequence(
                 details.append(f"ERROR_BITS[{bit_text}]")
             return False, ";".join(details) if details else "VERIFY_FAIL"
 
+    if feed_state is not None and feed_state.enabled:
+        feed_ok, feed_reason = _feed_reset_disable_enable(feed_state)
+        if not feed_ok:
+            return False, feed_reason
+
     sim2real_bridge.reset()
     if actuator_monitor is not None:
         actuator_monitor.clear_fault()
@@ -173,7 +221,7 @@ def perform_reset_sequence(
 
 def on_forward_state_change(is_pressed: bool, ts_sec: float) -> None:
     """
-    前进占位回调（当前阶段仅状态输出，不下发推进硬件指令）。
+    前进状态回调（仅记录边沿状态，真实推进由上层触发）。
     """
     log_event(
         "FORWARD_STATE_CHANGE",
@@ -216,6 +264,232 @@ def log_input_snapshot(
         payload["m3"] = int(motor_counts[2])
         payload["m4"] = int(motor_counts[3])
     log_event("INPUT", **payload)
+
+
+def _disabled_feed_state() -> FeedRuntimeState:
+    return FeedRuntimeState(
+        enabled=False,
+        cfg=None,
+        serial_link=None,
+        current_pulses=0,
+        locked=False,
+        next_forward_send_ts=0.0,
+        forward_limit_latched=False,
+    )
+
+
+def _validate_feed_port_conflict(
+    dry_run: bool,
+    actuator_serial_port: str,
+    feed_cfg: FeedConfig,
+    check_conflict: bool = True,
+) -> None:
+    """
+    实机模式下，电缸串口与滑台串口必须分离。
+    """
+    if not check_conflict:
+        return
+    if dry_run:
+        return
+    if not feed_cfg.teleop_enabled:
+        return
+    if str(actuator_serial_port).strip() == str(feed_cfg.port).strip():
+        raise ValueError(
+            f"teleop feed port conflict: actuator_port={actuator_serial_port} "
+            f"must be different from feed.port={feed_cfg.port}"
+        )
+
+
+def _feed_send_frame(feed_state: FeedRuntimeState, frame: bytes, event: str) -> bool:
+    if not feed_state.enabled or feed_state.cfg is None:
+        return False
+
+    cfg = feed_state.cfg
+    if cfg.dry_run:
+        log_event(event, frame=frame.hex(" ").upper())
+        return True
+
+    if feed_state.serial_link is None:
+        log_event("FEED_TX_FAIL", reason="SERIAL_NOT_READY")
+        return False
+
+    try:
+        wrote = feed_state.serial_link.write(frame)
+        feed_state.serial_link.flush()
+    except Exception as exc:
+        log_event("FEED_TX_FAIL", reason=str(exc))
+        return False
+
+    if wrote != len(frame):
+        log_event("FEED_TX_FAIL", reason=f"SHORT_WRITE wrote={wrote} expected={len(frame)}")
+        return False
+
+    log_event(event, frame=frame.hex(" ").upper())
+    return True
+
+
+def _feed_send_enable(feed_state: FeedRuntimeState, state: bool) -> bool:
+    if not feed_state.enabled or feed_state.cfg is None:
+        return True
+    frame = build_en_control_frame(
+        addr=feed_state.cfg.addr,
+        state=state,
+        sync_start=False,
+    )
+    return _feed_send_frame(
+        feed_state=feed_state,
+        frame=frame,
+        event="FEED_ENABLE" if state else "FEED_DISABLE",
+    )
+
+
+def _feed_send_forward_once(feed_state: FeedRuntimeState, step_pulses: int) -> bool:
+    if not feed_state.enabled or feed_state.cfg is None:
+        return True
+    cfg = feed_state.cfg
+    frame = build_pos_control_frame(
+        addr=cfg.addr,
+        dir_flag=resolve_forward_dir(cfg.invert_dir),
+        vel=cfg.default_vel,
+        acc=cfg.default_acc,
+        clk=int(step_pulses),
+        relative_mode=True,
+        sync_start=False,
+    )
+    return _feed_send_frame(feed_state=feed_state, frame=frame, event="FEED_FORWARD_TX")
+
+
+def _setup_feed_runtime(
+    config_path: str,
+    dry_run: bool,
+    actuator_serial_port: str,
+    check_port_conflict: bool = True,
+) -> FeedRuntimeState:
+    """
+    初始化 teleop 的 feed 链路。
+    """
+    feed_cfg = resolve_feed_config(dry_run=dry_run, config_path=config_path)
+    if not feed_cfg.teleop_enabled:
+        return _disabled_feed_state()
+
+    _validate_feed_port_conflict(
+        dry_run=dry_run,
+        actuator_serial_port=actuator_serial_port,
+        feed_cfg=feed_cfg,
+        check_conflict=check_port_conflict,
+    )
+
+    feed_serial_link: Optional[SerialLink] = None
+    if not dry_run:
+        if serial is None:
+            raise RuntimeError("pyserial is required. Install with: pip install pyserial")
+        feed_serial_link = serial.Serial(
+            feed_cfg.port,
+            baudrate=feed_cfg.baudrate,
+            timeout=feed_cfg.timeout,
+            write_timeout=0.2,
+        )
+
+    current_pulses = max(feed_cfg.min_pulses, min(0, feed_cfg.max_pulses))
+    feed_state = FeedRuntimeState(
+        enabled=True,
+        cfg=feed_cfg,
+        serial_link=feed_serial_link,
+        current_pulses=current_pulses,
+        locked=False,
+        next_forward_send_ts=0.0,
+        forward_limit_latched=False,
+    )
+    log_event(
+        "FEED_READY",
+        mode="DRY_RUN" if dry_run else "HARDWARE",
+        port=feed_cfg.port,
+        addr=feed_cfg.addr,
+        step=feed_cfg.step_pulses,
+        repeat_hz=feed_cfg.repeat_hz,
+        current=current_pulses,
+        min=feed_cfg.min_pulses,
+        max=feed_cfg.max_pulses,
+    )
+
+    if feed_cfg.enable_on_start and (not _feed_send_enable(feed_state, state=True)):
+        raise RuntimeError("feed enable_on_start failed")
+
+    return feed_state
+
+
+def _handle_feed_forward_rising_edge(ctx: TeleopRuntimeContext) -> str:
+    """
+    执行一次“前进一步进”尝试。
+
+    返回:
+        "sent"   : 本次成功发送
+        "limit"  : 命中限位（本次按住期间锁存）
+        "blocked": 锁存/禁用等状态不允许发送
+        "failed" : 发送失败并触发急停
+    """
+    feed_state = ctx.feed_state
+    if not feed_state.enabled or feed_state.cfg is None:
+        return "blocked"
+    if feed_state.locked or ctx.sim2real_bridge.estop_latched:
+        log_event("FEED_FORWARD_BLOCKED", reason="LOCKED")
+        return "blocked"
+    if feed_state.forward_limit_latched:
+        return "blocked"
+
+    if feed_state.reenable_pending:
+        if not _feed_send_enable(feed_state, state=True):
+            _latch_estop(ctx, reason="FEED_REENABLE_FAIL")
+            return "failed"
+        time.sleep(FEED_POST_RESET_PREMOVE_SETTLE_SEC)
+        feed_state.reenable_pending = False
+        log_event("FEED_REENABLE_OK")
+
+    cfg = feed_state.cfg
+    ok, next_pulses = compute_next_forward_target(
+        current_pulses=feed_state.current_pulses,
+        step_pulses=cfg.step_pulses,
+        min_pulses=cfg.min_pulses,
+        max_pulses=cfg.max_pulses,
+    )
+    if not ok:
+        log_event(
+            "LIMIT_HIT",
+            subsystem="FEED",
+            current=feed_state.current_pulses,
+            step=cfg.step_pulses,
+            min=cfg.min_pulses,
+            max=cfg.max_pulses,
+        )
+        feed_state.forward_limit_latched = True
+        return "limit"
+
+    if not _feed_send_forward_once(feed_state=feed_state, step_pulses=cfg.step_pulses):
+        _latch_estop(ctx, reason="FEED_TX_FAIL")
+        return "failed"
+
+    feed_state.current_pulses = int(next_pulses)
+    log_event("FEED_FORWARD_OK", current=feed_state.current_pulses, step=cfg.step_pulses)
+    return "sent"
+
+
+def _feed_reset_disable_enable(feed_state: FeedRuntimeState) -> Tuple[bool, str]:
+    """
+    feed 复位定义：失能 -> 使能（不移动）。
+    """
+    if not feed_state.enabled:
+        return True, "SKIP"
+    if not _feed_send_enable(feed_state, state=False):
+        return False, "FEED_DISABLE_FAIL"
+    time.sleep(FEED_RESET_DISABLE_SETTLE_SEC)
+    if not _feed_send_enable(feed_state, state=True):
+        return False, "FEED_ENABLE_FAIL"
+    time.sleep(FEED_RESET_ENABLE_SETTLE_SEC)
+    feed_state.locked = False
+    feed_state.reenable_pending = True
+    feed_state.forward_limit_latched = False
+    feed_state.next_forward_send_ts = 0.0
+    return True, "OK"
 
 
 def _setup_actuator_io(
@@ -286,6 +560,11 @@ def _latch_estop(
 
     if ctx.actuator_tx is not None:
         ctx.actuator_tx.send_estop_all(ctx.actuator_ids, critical=True)
+
+    if ctx.feed_state.enabled:
+        ctx.feed_state.locked = True
+        if not _feed_send_enable(ctx.feed_state, state=False):
+            log_event("FEED_DISABLE_FAIL", reason="ESTOP_LATCH")
     return True
 
 
@@ -301,10 +580,12 @@ def _run_boot_reset(ctx: TeleopRuntimeContext) -> None:
         sim2real_bridge=ctx.sim2real_bridge,
         monitor_settle_sec=ctx.monitor_settle_sec,
         dry_run=ctx.dry_run,
+        feed_state=ctx.feed_state,
+        allow_feed_without_actuator=ctx.allow_feed_without_actuator,
     )
     if not ok:
         log_event("BOOT_RESET_FAIL", reason=reason)
-        ctx.sim2real_bridge.estop_latched = True
+        _latch_estop(ctx, reason="BOOT_RESET_FAIL")
     else:
         log_event("BOOT_READY", mode="DRY_RUN" if ctx.dry_run else "HARDWARE")
 
@@ -343,13 +624,52 @@ def _compute_loop_dt(loop_state: TeleopLoopState, loop_start: float) -> float:
     return min(dt, 0.2)
 
 
-def _update_forward_placeholder(sample: GamepadSample, loop_state: TeleopLoopState) -> None:
+def _feed_repeat_period_sec(feed_state: FeedRuntimeState) -> float:
+    if feed_state.cfg is None:
+        return 0.1
+    return 1.0 / max(0.1, float(feed_state.cfg.repeat_hz))
+
+
+def _update_forward_state_and_feed(
+    sample: GamepadSample,
+    loop_state: TeleopLoopState,
+    ctx: TeleopRuntimeContext,
+    loop_start: float,
+) -> None:
     """
-    前进占位边沿检测，变化时触发回调。
+    前进键处理：边沿日志 + 按住连续进给（定时发送）。
     """
-    if sample.forward_pressed != loop_state.forward_pressed_prev:
-        loop_state.forward_pressed_prev = sample.forward_pressed
-        on_forward_state_change(sample.forward_pressed, time.time())
+    feed_state = ctx.feed_state
+    prev_pressed = bool(loop_state.forward_pressed_prev)
+    now_pressed = bool(sample.forward_pressed)
+    repeat_period = _feed_repeat_period_sec(feed_state)
+
+    if now_pressed != prev_pressed:
+        loop_state.forward_pressed_prev = now_pressed
+        on_forward_state_change(now_pressed, time.time())
+        if not now_pressed:
+            feed_state.forward_limit_latched = False
+            feed_state.next_forward_send_ts = loop_start
+            return
+
+        feed_state.forward_limit_latched = False
+        result = _handle_feed_forward_rising_edge(ctx)
+        feed_state.next_forward_send_ts = loop_start + repeat_period
+        if result == "limit":
+            feed_state.forward_limit_latched = True
+        return
+
+    if not now_pressed:
+        return
+    if feed_state.forward_limit_latched:
+        return
+    if loop_start < feed_state.next_forward_send_ts:
+        return
+
+    result = _handle_feed_forward_rising_edge(ctx)
+    feed_state.next_forward_send_ts = loop_start + repeat_period
+    if result == "limit":
+        feed_state.forward_limit_latched = True
 
 
 def _handle_disconnect_estop(
@@ -416,6 +736,8 @@ def _handle_manual_estop_and_reset(
         sim2real_bridge=ctx.sim2real_bridge,
         monitor_settle_sec=ctx.monitor_settle_sec,
         dry_run=ctx.dry_run,
+        feed_state=ctx.feed_state,
+        allow_feed_without_actuator=ctx.allow_feed_without_actuator,
     )
     if ok:
         log_event("RESET_SUCCESS")
@@ -608,6 +930,7 @@ def _cleanup_runtime(
     actuator_monitor: Optional[ActuatorMonitor],
     actuator_ids: Sequence[int],
     serial_link: Any,
+    feed_state: FeedRuntimeState,
 ) -> None:
     """
     退出阶段清理资源。
@@ -627,6 +950,18 @@ def _cleanup_runtime(
             serial_link.close()
         except Exception:
             pass
+
+    if feed_state.enabled and feed_state.cfg is not None:
+        try:
+            if feed_state.cfg.disable_on_exit:
+                _feed_send_enable(feed_state, state=False)
+        except Exception:
+            pass
+        if feed_state.serial_link is not None:
+            try:
+                feed_state.serial_link.close()
+            except Exception:
+                pass
 
     gamepad.close()
 
@@ -660,6 +995,7 @@ def run_teleop(
     """
     runtime_cfg = load_dagger_sim2real_runtime_config(config_path)
     teleop_cfg = load_teleop_config(config_path)
+    feed_only_mode = bool(teleop_cfg.allow_feed_without_actuator)
     for warning in teleop_cfg.deprecation_warnings:
         log_event("DEPRECATED_CONFIG", message=warning)
 
@@ -683,14 +1019,25 @@ def run_teleop(
     actuator_tx: Optional[ActuatorTx] = None
     actuator_monitor: Optional[ActuatorMonitor] = None
     serial_link = None
+    feed_state = _disabled_feed_state()
 
     try:
-        actuator_tx, actuator_monitor, serial_link = _setup_actuator_io(
-            runtime_cfg=runtime_cfg,
-            sim2real_cfg=sim2real_cfg,
-            monitor_cfg=monitor_cfg,
-            actuator_ids=actuator_ids,
+        if not feed_only_mode:
+            actuator_tx, actuator_monitor, serial_link = _setup_actuator_io(
+                runtime_cfg=runtime_cfg,
+                sim2real_cfg=sim2real_cfg,
+                monitor_cfg=monitor_cfg,
+                actuator_ids=actuator_ids,
+                dry_run=dry_run,
+            )
+        else:
+            log_event("ACTUATOR_BYPASS", mode="FEED_ONLY")
+
+        feed_state = _setup_feed_runtime(
+            config_path=config_path,
             dry_run=dry_run,
+            actuator_serial_port=sim2real_cfg.serial_port,
+            check_port_conflict=(not feed_only_mode),
         )
         ctx = TeleopRuntimeContext(
             sim2real_bridge=sim2real_bridge,
@@ -699,27 +1046,35 @@ def run_teleop(
             actuator_tx=actuator_tx,
             actuator_monitor=actuator_monitor,
             monitor_settle_sec=monitor_cfg.response_timeout_sec,
+            feed_state=feed_state,
             dry_run=dry_run,
+            allow_feed_without_actuator=feed_only_mode,
         )
         loop_state = _create_loop_state(control_hz=sim2real_cfg.control_hz)
-        _run_boot_reset(ctx)
+        if feed_only_mode:
+            log_event("BOOT_READY", mode="FEED_ONLY")
+        else:
+            _run_boot_reset(ctx)
 
         while True:
             loop_start = time.monotonic()
             dt = _compute_loop_dt(loop_state, loop_start)
 
             sample = gamepad.poll()
-            _update_forward_placeholder(sample, loop_state)
+            _update_forward_state_and_feed(sample, loop_state, ctx, loop_start)
             _handle_disconnect_estop(sample, loop_start, teleop_cfg, loop_state, ctx)
             _handle_manual_estop_and_reset(sample, loop_start, teleop_cfg, loop_state, ctx)
             _handle_monitor_fault(ctx)
             _sync_monitor_active_state(ctx)
 
-            yaw_rate, pitch_rate, delta_yaw, delta_pitch = _compute_control_delta(
-                sample=sample,
-                teleop_cfg=teleop_cfg,
-                dt=dt,
-            )
+            if feed_only_mode:
+                yaw_rate, pitch_rate, delta_yaw, delta_pitch = 0.0, 0.0, 0.0, 0.0
+            else:
+                yaw_rate, pitch_rate, delta_yaw, delta_pitch = _compute_control_delta(
+                    sample=sample,
+                    teleop_cfg=teleop_cfg,
+                    dt=dt,
+                )
             _maybe_log_debug_snapshot(
                 enabled=debug_input,
                 loop_start=loop_start,
@@ -732,12 +1087,13 @@ def run_teleop(
                 loop_state=loop_state,
                 ctx=ctx,
             )
-            _step_bridge_and_send(
-                delta_yaw=delta_yaw,
-                delta_pitch=delta_pitch,
-                dt=dt,
-                ctx=ctx,
-            )
+            if not feed_only_mode:
+                _step_bridge_and_send(
+                    delta_yaw=delta_yaw,
+                    delta_pitch=delta_pitch,
+                    dt=dt,
+                    ctx=ctx,
+                )
             _sleep_for_rate(loop_start, loop_state.period_sec)
     except KeyboardInterrupt:
         log_event("STOP", reason="KEYBOARD_INTERRUPT")
@@ -748,6 +1104,7 @@ def run_teleop(
             actuator_monitor=actuator_monitor,
             actuator_ids=actuator_ids,
             serial_link=serial_link,
+            feed_state=feed_state,
         )
 
     return 0

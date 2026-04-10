@@ -32,6 +32,8 @@ class TeleopConfig:
     invert_pitch: bool = True
     hold_sec: float = 1.0
     disconnect_timeout_sec: float = 0.5
+    # 显式开启“无电缸仅滑台”模式（默认关闭，避免影响原流程）
+    allow_feed_without_actuator: bool = False
 
     # ---- Internal defaults / backward compatibility ----
     backend: str = "pygame"
@@ -61,6 +63,7 @@ class TeleopConfig:
         self.invert_yaw = bool(self.invert_yaw)
         self.invert_pitch = bool(self.invert_pitch)
         self.hold_sec = float(self.hold_sec)
+        self.allow_feed_without_actuator = bool(self.allow_feed_without_actuator)
         self.forward_button = str(self.forward_button).strip().lower()
         self.estop_button = str(self.estop_button).strip().lower()
         self.reset_combo = tuple(str(x).strip().lower() for x in self.reset_combo)
@@ -146,6 +149,12 @@ def _build_effective_teleop_config(teleop_raw: Mapping[str, Any]) -> TeleopConfi
     disconnect_timeout_sec = float(
         teleop_raw.get("disconnect_timeout_sec", defaults.disconnect_timeout_sec)
     )
+    allow_feed_without_actuator = bool(
+        teleop_raw.get(
+            "allow_feed_without_actuator",
+            defaults.allow_feed_without_actuator,
+        )
+    )
 
     # 新字段优先：hold_sec 作为 estop/reset 长按默认值
     estop_hold_sec = hold_sec
@@ -214,6 +223,7 @@ def _build_effective_teleop_config(teleop_raw: Mapping[str, Any]) -> TeleopConfi
         invert_pitch=invert_pitch,
         hold_sec=hold_sec,
         disconnect_timeout_sec=disconnect_timeout_sec,
+        allow_feed_without_actuator=allow_feed_without_actuator,
         backend=backend,
         controller_name_contains=controller_name_contains,
         left_stick_x_axis=left_stick_x_axis,

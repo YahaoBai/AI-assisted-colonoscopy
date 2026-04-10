@@ -4,9 +4,9 @@
 控制链路总览（展示版）:
 1) Gamepad Input (pygame controller)
    -> 2) axis/button parsing + deadzone + hold detection
-   -> 3) yaw/pitch delta generation
+   -> 3) yaw/pitch delta generation + feed forward edge trigger
    -> 4) Sim2RealBridge (angle/motor limit + estop latch)
-   -> 5) MotorMapper + ActuatorTx (F3 follow / ESTOP / RESET sequence)
+   -> 5) MotorMapper + ActuatorTx + FeedTx (F3 follow / ESTOP / RESET sequence)
 
 设计目标:
 - 与 il.py 自动驾驶入口解耦，专注手动上机联调。

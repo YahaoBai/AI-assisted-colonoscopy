@@ -3,13 +3,17 @@ import tempfile
 import textwrap
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
+import control.teleop_runtime as tr
+from control.feed import FeedConfig
 from control.sim2real_bridge import BridgeCommand, FaultClearVerification
 from control.teleop import (
     HoldLatch,
     PygameGamepadInput,
+    TeleopConfig,
     apply_deadzone,
     axis_to_rate,
     build_arg_parser,
@@ -21,6 +25,10 @@ from control.teleop import (
 
 
 class FakeMapper:
+    def __init__(self, *args, **kwargs):
+        _ = args
+        _ = kwargs
+
     def mm_targets_to_counts(self, mm_targets: np.ndarray) -> np.ndarray:
         arr = np.asarray(mm_targets, dtype=np.float64).reshape(-1)
         if arr.shape != (4,):
@@ -86,12 +94,163 @@ class FakeMonitor:
 class FakeBridge:
     def __init__(self):
         self.reset_called = 0
+        self.estop_latched = False
 
     def reset(self):
         self.reset_called += 1
 
+    def step(self, delta_yaw: float, delta_pitch: float, dt: float):
+        return SimpleNamespace(
+            command=BridgeCommand.CMD,
+            should_send=False,
+            motor_target_mm=np.zeros(4, dtype=np.float64),
+            reason="",
+        )
+
+
+class FakeFeedSerial:
+    def __init__(self):
+        self.writes = []
+        self.closed = False
+
+    def write(self, data: bytes) -> int:
+        self.writes.append(bytes(data))
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeRuntimeBridge:
+    def __init__(self, *args, **kwargs):
+        _ = args
+        _ = kwargs
+        self.estop_latched = False
+        self.motor_target_mm = np.zeros(4, dtype=np.float64)
+        self.reset_called = 0
+
+    def reset(self) -> None:
+        self.reset_called += 1
+
+    def step(self, delta_yaw: float, delta_pitch: float, dt: float):
+        _ = delta_yaw
+        _ = delta_pitch
+        _ = dt
+        return SimpleNamespace(
+            command=BridgeCommand.CMD,
+            should_send=False,
+            motor_target_mm=np.zeros(4, dtype=np.float64),
+            reason="",
+        )
+
+
+class FakeRuntimeGamepad:
+    def __init__(self, cfg):
+        _ = cfg
+        self.controller_index = 0
+        self.controller_name = "fake-gamepad"
+        self._poll_count = 0
+
+    def list_controllers(self):
+        return [(0, "fake-gamepad", True)]
+
+    def open(self) -> None:
+        return None
+
+    def poll(self):
+        self._poll_count += 1
+        if self._poll_count == 1:
+            return SimpleNamespace(
+                timestamp_sec=0.0,
+                axis_x=0.7,
+                axis_y=-0.7,
+                forward_pressed=False,
+                estop_pressed=False,
+                reset_primary_pressed=False,
+                reset_secondary_pressed=False,
+                connected=True,
+            )
+        raise KeyboardInterrupt()
+
+    def close(self) -> None:
+        return None
+
 
 class TeleopCoreTests(unittest.TestCase):
+    @staticmethod
+    def _make_feed_state(
+        *,
+        teleop_enabled: bool = True,
+        dry_run: bool = True,
+        locked: bool = False,
+        repeat_hz: float = 10.0,
+    ) -> tr.FeedRuntimeState:
+        cfg = FeedConfig(
+            port="/dev/ttyUSB1",
+            baudrate=115200,
+            timeout=0.05,
+            addr=1,
+            step_pulses=200,
+            repeat_hz=repeat_hz,
+            default_vel=100,
+            default_acc=0,
+            invert_dir=False,
+            min_pulses=0,
+            max_pulses=1000,
+            enable_on_start=True,
+            disable_on_exit=True,
+            teleop_enabled=teleop_enabled,
+            dry_run=dry_run,
+        )
+        cfg.validate()
+        return tr.FeedRuntimeState(
+            enabled=bool(teleop_enabled),
+            cfg=cfg,
+            serial_link=FakeFeedSerial() if (teleop_enabled and (not dry_run)) else None,
+            current_pulses=0,
+            locked=bool(locked),
+        )
+
+    @staticmethod
+    def _make_ctx(feed_state: tr.FeedRuntimeState) -> tr.TeleopRuntimeContext:
+        return tr.TeleopRuntimeContext(
+            sim2real_bridge=FakeBridge(),
+            motor_mapper=FakeMapper(),
+            actuator_ids=(1, 2, 3, 4),
+            actuator_tx=None,
+            actuator_monitor=None,
+            monitor_settle_sec=0.02,
+            feed_state=feed_state,
+            dry_run=True,
+            allow_feed_without_actuator=False,
+        )
+
+    @staticmethod
+    def _make_runtime_cfg():
+        class _ActuatorCfg:
+            @staticmethod
+            def ids_for_motor_order(_order):
+                return (1, 2, 3, 4)
+
+        return SimpleNamespace(
+            bridge=SimpleNamespace(
+                serial_port="/dev/ttyUSB0",
+                serial_baudrate=115200,
+                serial_timeout=0.0,
+                serial_write_timeout=0.2,
+                serial_critical_retry_count=3,
+                serial_critical_retry_interval_sec=0.02,
+                control_hz=30.0,
+                motor_order=("m1", "m2", "m3", "m4"),
+            ),
+            actuator=_ActuatorCfg(),
+            monitor=SimpleNamespace(response_timeout_sec=0.02),
+            output=SimpleNamespace(print_tx_frame=False),
+        )
+
     def test_apply_deadzone_and_rescale(self) -> None:
         self.assertAlmostEqual(apply_deadzone(0.10, 0.15), 0.0)
         self.assertAlmostEqual(apply_deadzone(-0.10, 0.15), 0.0)
@@ -219,6 +378,377 @@ class TeleopCoreTests(unittest.TestCase):
         self.assertEqual(bridge.reset_called, 0)
         self.assertFalse(monitor.clear_fault_called)
 
+    def test_forward_hold_repeats_by_repeat_hz(self) -> None:
+        feed_state = self._make_feed_state(
+            teleop_enabled=True,
+            dry_run=True,
+            locked=False,
+            repeat_hz=5.0,  # 0.2s period
+        )
+        ctx = self._make_ctx(feed_state)
+        loop_state = tr._create_loop_state(control_hz=30.0)
+
+        with patch(
+            "control.teleop_runtime._handle_feed_forward_rising_edge",
+            return_value="sent",
+        ) as mock_feed_step:
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.00,
+            )
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.10,
+            )
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.21,
+            )
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.42,
+            )
+        self.assertEqual(mock_feed_step.call_count, 3)
+
+    def test_forward_release_stops_repeat(self) -> None:
+        feed_state = self._make_feed_state(
+            teleop_enabled=True,
+            dry_run=True,
+            locked=False,
+            repeat_hz=10.0,
+        )
+        ctx = self._make_ctx(feed_state)
+        loop_state = tr._create_loop_state(control_hz=30.0)
+
+        with patch(
+            "control.teleop_runtime._handle_feed_forward_rising_edge",
+            return_value="sent",
+        ) as mock_feed_step:
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.00,
+            )
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=False),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.05,
+            )
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=False),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.50,
+            )
+        self.assertEqual(mock_feed_step.call_count, 1)
+
+    def test_forward_limit_latched_until_release(self) -> None:
+        feed_state = self._make_feed_state(
+            teleop_enabled=True,
+            dry_run=True,
+            locked=False,
+            repeat_hz=10.0,
+        )
+        ctx = self._make_ctx(feed_state)
+        loop_state = tr._create_loop_state(control_hz=30.0)
+
+        with patch(
+            "control.teleop_runtime._handle_feed_forward_rising_edge",
+            side_effect=["limit", "sent"],
+        ) as mock_feed_step:
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.00,
+            )
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.20,
+            )
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=False),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.30,
+            )
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.40,
+            )
+        self.assertEqual(mock_feed_step.call_count, 2)
+
+    def test_feed_forward_blocked_when_locked(self) -> None:
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=True)
+        ctx = self._make_ctx(feed_state)
+        with patch("control.teleop_runtime._feed_send_forward_once") as mock_send:
+            tr._handle_feed_forward_rising_edge(ctx)
+        mock_send.assert_not_called()
+
+    def test_feed_forward_ignored_when_teleop_disabled(self) -> None:
+        feed_state = self._make_feed_state(teleop_enabled=False, dry_run=True, locked=False)
+        ctx = self._make_ctx(feed_state)
+        with patch("control.teleop_runtime._feed_send_forward_once") as mock_send:
+            tr._handle_feed_forward_rising_edge(ctx)
+        mock_send.assert_not_called()
+
+    def test_feed_forward_blocked_when_estop_latched(self) -> None:
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
+        ctx = self._make_ctx(feed_state)
+        ctx.sim2real_bridge.estop_latched = True
+        with patch("control.teleop_runtime._feed_send_forward_once") as mock_send:
+            tr._handle_feed_forward_rising_edge(ctx)
+        mock_send.assert_not_called()
+
+    def test_feed_forward_reenable_pending_enable_then_send(self) -> None:
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
+        feed_state.reenable_pending = True
+        ctx = self._make_ctx(feed_state)
+        with patch("control.teleop_runtime._feed_send_enable", return_value=True) as mock_enable, patch(
+            "control.teleop_runtime._feed_send_forward_once",
+            return_value=True,
+        ) as mock_send, patch("control.teleop_runtime.time.sleep", return_value=None):
+            result = tr._handle_feed_forward_rising_edge(ctx)
+        self.assertEqual(result, "sent")
+        mock_enable.assert_called_once_with(feed_state, state=True)
+        mock_send.assert_called_once()
+        self.assertFalse(feed_state.reenable_pending)
+
+    def test_estop_latch_disables_and_locks_feed(self) -> None:
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
+        ctx = self._make_ctx(feed_state)
+        with patch("control.teleop_runtime._feed_send_enable", return_value=True) as mock_enable:
+            fired = tr._latch_estop(ctx, reason="TEST_ESTOP")
+        self.assertTrue(fired)
+        self.assertTrue(ctx.sim2real_bridge.estop_latched)
+        self.assertTrue(feed_state.locked)
+        mock_enable.assert_called_once_with(feed_state, state=False)
+
+    def test_reset_sequence_success_includes_feed_disable_enable(self) -> None:
+        calls = []
+        tx = FakeTx(calls)
+        monitor = FakeMonitor(verify_ok=True)
+        bridge = FakeBridge()
+        mapper = FakeMapper()
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=False, locked=True)
+
+        with patch("control.teleop_runtime._feed_send_enable", side_effect=[True, True]) as mock_enable:
+            ok, reason = perform_reset_sequence(
+                actuator_tx=tx,
+                actuator_monitor=monitor,
+                motor_mapper=mapper,
+                actuator_ids=(1, 2, 3, 4),
+                sim2real_bridge=bridge,
+                monitor_settle_sec=0.02,
+                dry_run=False,
+                feed_state=feed_state,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "OK")
+        self.assertFalse(feed_state.locked)
+        self.assertEqual(mock_enable.call_count, 2)
+
+    def test_reset_sequence_fail_when_feed_reenable_fails(self) -> None:
+        calls = []
+        tx = FakeTx(calls)
+        monitor = FakeMonitor(verify_ok=True)
+        bridge = FakeBridge()
+        mapper = FakeMapper()
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=False, locked=True)
+
+        with patch("control.teleop_runtime._feed_send_enable", side_effect=[True, False]) as mock_enable:
+            ok, reason = perform_reset_sequence(
+                actuator_tx=tx,
+                actuator_monitor=monitor,
+                motor_mapper=mapper,
+                actuator_ids=(1, 2, 3, 4),
+                sim2real_bridge=bridge,
+                monitor_settle_sec=0.02,
+                dry_run=False,
+                feed_state=feed_state,
+            )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "FEED_ENABLE_FAIL")
+        self.assertTrue(feed_state.locked)
+        self.assertEqual(mock_enable.call_count, 2)
+
+    def test_reset_sequence_feed_only_success(self) -> None:
+        bridge = FakeBridge()
+        mapper = FakeMapper()
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=False, locked=True)
+
+        with patch("control.teleop_runtime._feed_send_enable", side_effect=[True, True]) as mock_enable:
+            ok, reason = perform_reset_sequence(
+                actuator_tx=None,
+                actuator_monitor=None,
+                motor_mapper=mapper,
+                actuator_ids=(1, 2, 3, 4),
+                sim2real_bridge=bridge,
+                monitor_settle_sec=0.02,
+                dry_run=False,
+                feed_state=feed_state,
+                allow_feed_without_actuator=True,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "OK_FEED_ONLY")
+        self.assertFalse(feed_state.locked)
+        self.assertEqual(bridge.reset_called, 1)
+        self.assertEqual(mock_enable.call_count, 2)
+
+    def test_reset_sequence_feed_only_fail_keeps_latch(self) -> None:
+        bridge = FakeBridge()
+        mapper = FakeMapper()
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=False, locked=True)
+
+        with patch("control.teleop_runtime._feed_send_enable", side_effect=[True, False]) as mock_enable:
+            ok, reason = perform_reset_sequence(
+                actuator_tx=None,
+                actuator_monitor=None,
+                motor_mapper=mapper,
+                actuator_ids=(1, 2, 3, 4),
+                sim2real_bridge=bridge,
+                monitor_settle_sec=0.02,
+                dry_run=False,
+                feed_state=feed_state,
+                allow_feed_without_actuator=True,
+            )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "FEED_ENABLE_FAIL")
+        self.assertTrue(feed_state.locked)
+        self.assertEqual(bridge.reset_called, 0)
+        self.assertEqual(mock_enable.call_count, 2)
+
+    def test_port_conflict_validation(self) -> None:
+        cfg = FeedConfig(port="/dev/ttyUSB0", teleop_enabled=True)
+        cfg.validate()
+        with self.assertRaises(ValueError):
+            tr._validate_feed_port_conflict(
+                dry_run=False,
+                actuator_serial_port="/dev/ttyUSB0",
+                feed_cfg=cfg,
+            )
+        tr._validate_feed_port_conflict(
+            dry_run=True,
+            actuator_serial_port="/dev/ttyUSB0",
+            feed_cfg=cfg,
+        )
+
+    def test_run_teleop_feed_only_mode_skips_actuator_and_bridge(self) -> None:
+        runtime_cfg = self._make_runtime_cfg()
+        teleop_cfg = TeleopConfig(allow_feed_without_actuator=True)
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
+
+        with patch(
+            "control.teleop_runtime.load_dagger_sim2real_runtime_config",
+            return_value=runtime_cfg,
+        ), patch(
+            "control.teleop_runtime.load_teleop_config",
+            return_value=teleop_cfg,
+        ), patch(
+            "control.teleop_runtime.PygameGamepadInput",
+            FakeRuntimeGamepad,
+        ), patch(
+            "control.teleop_runtime.Sim2RealBridge",
+            FakeRuntimeBridge,
+        ), patch(
+            "control.teleop_runtime.MotorMapper",
+            FakeMapper,
+        ), patch(
+            "control.teleop_runtime._setup_actuator_io"
+        ) as mock_setup_actuator, patch(
+            "control.teleop_runtime._setup_feed_runtime",
+            return_value=feed_state,
+        ) as mock_setup_feed, patch(
+            "control.teleop_runtime._run_boot_reset"
+        ) as mock_boot_reset, patch(
+            "control.teleop_runtime._compute_control_delta"
+        ) as mock_compute_delta, patch(
+            "control.teleop_runtime._step_bridge_and_send"
+        ) as mock_bridge_send, patch(
+            "control.teleop_runtime._sleep_for_rate",
+            return_value=None,
+        ):
+            rc = tr.run_teleop(
+                config_path="control/sim2real_config.yaml",
+                dry_run=True,
+                debug_input=False,
+                list_controllers_only=False,
+            )
+
+        self.assertEqual(rc, 0)
+        mock_setup_actuator.assert_not_called()
+        mock_boot_reset.assert_not_called()
+        mock_compute_delta.assert_not_called()
+        mock_bridge_send.assert_not_called()
+        self.assertEqual(mock_setup_feed.call_count, 1)
+        self.assertFalse(mock_setup_feed.call_args.kwargs["check_port_conflict"])
+
+    def test_run_teleop_default_mode_keeps_actuator_path(self) -> None:
+        runtime_cfg = self._make_runtime_cfg()
+        teleop_cfg = TeleopConfig(allow_feed_without_actuator=False)
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
+
+        with patch(
+            "control.teleop_runtime.load_dagger_sim2real_runtime_config",
+            return_value=runtime_cfg,
+        ), patch(
+            "control.teleop_runtime.load_teleop_config",
+            return_value=teleop_cfg,
+        ), patch(
+            "control.teleop_runtime.PygameGamepadInput",
+            FakeRuntimeGamepad,
+        ), patch(
+            "control.teleop_runtime.Sim2RealBridge",
+            FakeRuntimeBridge,
+        ), patch(
+            "control.teleop_runtime.MotorMapper",
+            FakeMapper,
+        ), patch(
+            "control.teleop_runtime._setup_actuator_io",
+            return_value=(None, None, None),
+        ) as mock_setup_actuator, patch(
+            "control.teleop_runtime._setup_feed_runtime",
+            return_value=feed_state,
+        ) as mock_setup_feed, patch(
+            "control.teleop_runtime._run_boot_reset"
+        ) as mock_boot_reset, patch(
+            "control.teleop_runtime._compute_control_delta",
+            return_value=(0.1, 0.1, 0.01, 0.01),
+        ) as mock_compute_delta, patch(
+            "control.teleop_runtime._step_bridge_and_send"
+        ) as mock_bridge_send, patch(
+            "control.teleop_runtime._sleep_for_rate",
+            return_value=None,
+        ):
+            rc = tr.run_teleop(
+                config_path="control/sim2real_config.yaml",
+                dry_run=True,
+                debug_input=False,
+                list_controllers_only=False,
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(mock_setup_actuator.call_count, 1)
+        self.assertEqual(mock_boot_reset.call_count, 1)
+        self.assertGreaterEqual(mock_compute_delta.call_count, 1)
+        self.assertGreaterEqual(mock_bridge_send.call_count, 1)
+        self.assertEqual(mock_setup_feed.call_count, 1)
+        self.assertTrue(mock_setup_feed.call_args.kwargs["check_port_conflict"])
+
 
 class TeleopConfigCompatTests(unittest.TestCase):
     def _write_yaml(self, yaml_text: str) -> str:
@@ -257,7 +787,19 @@ class TeleopConfigCompatTests(unittest.TestCase):
         self.assertAlmostEqual(cfg.disconnect_timeout_sec, 0.6)
         self.assertEqual(cfg.estop_button, "south")
         self.assertEqual(cfg.reset_combo, ("west", "west"))
+        self.assertFalse(cfg.allow_feed_without_actuator)
         self.assertEqual(cfg.deprecation_warnings, ())
+
+    def test_load_teleop_config_allow_feed_without_actuator_true(self) -> None:
+        path = self._write_yaml(
+            """
+            sim2real:
+              teleop:
+                allow_feed_without_actuator: true
+            """
+        )
+        cfg = load_teleop_config(path)
+        self.assertTrue(cfg.allow_feed_without_actuator)
 
     def test_load_teleop_config_legacy_hold_overrides_new_hold(self) -> None:
         path = self._write_yaml(
