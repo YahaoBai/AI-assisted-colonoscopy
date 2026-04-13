@@ -948,6 +948,172 @@ sim2real:
         self.assertEqual(runtime_cfg.output.plot_dpi, 150)
         self.assertEqual(runtime_cfg.output.max_plot_points, 1234)
 
+    def test_yaml_runtime_config_rejects_missing_bridge_limit(self) -> None:
+        yaml_text = """
+sim2real:
+  J_4x2_mm_per_rad:
+    - [1.0, 0.0]
+    - [-1.0, 0.0]
+    - [0.0, 1.0]
+    - [0.0, -1.0]
+  yaw_limit_deg: 120.0
+  pitch_limit_deg: 120.0
+  control_hz: 30.0
+  motor_order: ["m1", "m2", "m3", "m4"]
+  serial:
+    port: "/dev/ttyUSB0"
+    baudrate: 115200
+    timeout: 0.0
+    write_timeout: 0.2
+    critical_retry_count: 3
+    critical_retry_interval_sec: 0.02
+  actuator:
+    mode: broadcast_follow_no_feedback
+    ids: [1, 2, 3, 4]
+    id_by_motor:
+      m1: 1
+      m2: 2
+      m3: 3
+      m4: 4
+    position_index: 0x37
+    count_min: 0
+    count_max: 2000
+    per_motor:
+      m1:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+      m2:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+      m3:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+      m4:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+  alarm:
+    enabled: true
+    repeat: 3
+    terminal_bell: true
+    banner_width: 70
+  monitor:
+    enabled: true
+    query_hz: 20.0
+    response_timeout_sec: 0.02
+    failure_threshold: 3
+    error_mask: 0x0F
+    log_every_n: 5
+  output:
+    print_tx_frame: false
+    print_every_n: 0
+    save_csv: true
+    csv_path: "./sim2real_motor_log.csv"
+    save_plot: true
+    plot_path: "./sim2real_motor_plot.png"
+    plot_dpi: 120
+    max_plot_points: 4000
+"""
+        with NamedTemporaryFile("w+", suffix=".yaml", encoding="utf-8") as fp:
+            fp.write(yaml_text)
+            fp.flush()
+            with self.assertRaisesRegex(ValueError, "sim2real.motor_limit_mm"):
+                load_dagger_sim2real_runtime_config(fp.name)
+
+    def test_yaml_runtime_config_rejects_missing_serial_write_timeout(self) -> None:
+        yaml_text = """
+sim2real:
+  J_4x2_mm_per_rad:
+    - [1.0, 0.0]
+    - [-1.0, 0.0]
+    - [0.0, 1.0]
+    - [0.0, -1.0]
+  yaw_limit_deg: 120.0
+  pitch_limit_deg: 120.0
+  motor_limit_mm: 10.0
+  control_hz: 30.0
+  motor_order: ["m1", "m2", "m3", "m4"]
+  serial:
+    port: "/dev/ttyUSB0"
+    baudrate: 115200
+    timeout: 0.0
+    critical_retry_count: 3
+    critical_retry_interval_sec: 0.02
+  actuator:
+    mode: broadcast_follow_no_feedback
+    ids: [1, 2, 3, 4]
+    id_by_motor:
+      m1: 1
+      m2: 2
+      m3: 3
+      m4: 4
+    position_index: 0x37
+    count_min: 0
+    count_max: 2000
+    per_motor:
+      m1:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+      m2:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+      m3:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+      m4:
+        zero_count: 1000
+        count_per_mm: 40.0
+        sign: 1
+        soft_min_count: 300
+        soft_max_count: 1700
+  alarm:
+    enabled: true
+    repeat: 3
+    terminal_bell: true
+    banner_width: 70
+  monitor:
+    enabled: true
+    query_hz: 20.0
+    response_timeout_sec: 0.02
+    failure_threshold: 3
+    error_mask: 0x0F
+    log_every_n: 5
+  output:
+    print_tx_frame: false
+    print_every_n: 0
+    save_csv: true
+    csv_path: "./sim2real_motor_log.csv"
+    save_plot: true
+    plot_path: "./sim2real_motor_plot.png"
+    plot_dpi: 120
+    max_plot_points: 4000
+"""
+        with NamedTemporaryFile("w+", suffix=".yaml", encoding="utf-8") as fp:
+            fp.write(yaml_text)
+            fp.flush()
+            with self.assertRaisesRegex(ValueError, "sim2real.serial.write_timeout"):
+                load_dagger_sim2real_runtime_config(fp.name)
+
 
 if __name__ == "__main__":
     unittest.main()

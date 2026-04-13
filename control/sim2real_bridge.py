@@ -1083,42 +1083,19 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
     if not isinstance(raw, Mapping):
         raise ValueError("Top-level YAML content must be a mapping/object.")
 
-    defaults = default_dagger_sim2real_runtime_config()
-    sim2real_raw = raw.get("sim2real", {})
+    sim2real_raw = raw.get("sim2real", None)
+    if sim2real_raw is None:
+        raise ValueError("`sim2real` is required.")
     if not isinstance(sim2real_raw, Mapping):
         raise ValueError("`sim2real` must be a mapping/object.")
 
-    serial_raw = sim2real_raw.get("serial", {})
-    if serial_raw is None:
-        serial_raw = {}
-    if not isinstance(serial_raw, Mapping):
-        raise ValueError("`sim2real.serial` must be a mapping/object.")
+    serial_raw = _require_mapping(sim2real_raw, "serial", "sim2real.serial")
+    alarm_raw = _require_mapping(sim2real_raw, "alarm", "sim2real.alarm")
+    output_raw = _require_mapping(sim2real_raw, "output", "sim2real.output")
+    monitor_raw = _require_mapping(sim2real_raw, "monitor", "sim2real.monitor")
+    actuator_raw = _require_mapping(sim2real_raw, "actuator", "sim2real.actuator")
 
-    alarm_raw = sim2real_raw.get("alarm", {})
-    if alarm_raw is None:
-        alarm_raw = {}
-    if not isinstance(alarm_raw, Mapping):
-        raise ValueError("`sim2real.alarm` must be a mapping/object.")
-
-    output_raw = sim2real_raw.get("output", {})
-    if output_raw is None:
-        output_raw = {}
-    if not isinstance(output_raw, Mapping):
-        raise ValueError("`sim2real.output` must be a mapping/object.")
-
-    monitor_raw = sim2real_raw.get("monitor", {})
-    if monitor_raw is None:
-        monitor_raw = {}
-    if not isinstance(monitor_raw, Mapping):
-        raise ValueError("`sim2real.monitor` must be a mapping/object.")
-
-    actuator_raw = sim2real_raw.get("actuator", None)
-    if actuator_raw is None:
-        raise ValueError("`sim2real.actuator` is required for direct LA actuator control.")
-    if not isinstance(actuator_raw, Mapping):
-        raise ValueError("`sim2real.actuator` must be a mapping/object.")
-
-    motor_order_raw = sim2real_raw.get("motor_order", defaults.bridge.motor_order)
+    motor_order_raw = _require_value(sim2real_raw, "motor_order", "sim2real.motor_order")
     if isinstance(motor_order_raw, str):
         raise ValueError("`sim2real.motor_order` must be a list containing m1,m2,m3,m4 in some order.")
     motor_order = tuple(str(x).strip() for x in motor_order_raw)
@@ -1129,80 +1106,94 @@ def load_dagger_sim2real_runtime_config(config_path: str | Path) -> DaggerSim2Re
 
     bridge_cfg = Sim2RealConfig(
         J_4x2_mm_per_rad=_coerce_matrix(
-            sim2real_raw.get("J_4x2_mm_per_rad", defaults.bridge.J_4x2_mm_per_rad)
+            _require_value(sim2real_raw, "J_4x2_mm_per_rad", "sim2real.J_4x2_mm_per_rad")
         ),
-        yaw_limit_deg=float(sim2real_raw.get("yaw_limit_deg", defaults.bridge.yaw_limit_deg)),
-        pitch_limit_deg=float(sim2real_raw.get("pitch_limit_deg", defaults.bridge.pitch_limit_deg)),
-        motor_limit_mm=float(sim2real_raw.get("motor_limit_mm", defaults.bridge.motor_limit_mm)),
-        control_hz=float(sim2real_raw.get("control_hz", defaults.bridge.control_hz)),
+        yaw_limit_deg=float(_require_value(sim2real_raw, "yaw_limit_deg", "sim2real.yaw_limit_deg")),
+        pitch_limit_deg=float(_require_value(sim2real_raw, "pitch_limit_deg", "sim2real.pitch_limit_deg")),
+        motor_limit_mm=float(_require_value(sim2real_raw, "motor_limit_mm", "sim2real.motor_limit_mm")),
+        control_hz=float(_require_value(sim2real_raw, "control_hz", "sim2real.control_hz")),
         motor_order=motor_order,
-        serial_port=str(serial_raw.get("port", defaults.bridge.serial_port)),
-        serial_baudrate=int(serial_raw.get("baudrate", defaults.bridge.serial_baudrate)),
-        serial_timeout=float(serial_raw.get("timeout", defaults.bridge.serial_timeout)),
+        serial_port=str(_require_value(serial_raw, "port", "sim2real.serial.port")),
+        serial_baudrate=int(_require_value(serial_raw, "baudrate", "sim2real.serial.baudrate")),
+        serial_timeout=float(_require_value(serial_raw, "timeout", "sim2real.serial.timeout")),
         serial_write_timeout=float(
-            serial_raw.get("write_timeout", defaults.bridge.serial_write_timeout)
+            _require_value(serial_raw, "write_timeout", "sim2real.serial.write_timeout")
         ),
         serial_critical_retry_count=int(
-            serial_raw.get("critical_retry_count", defaults.bridge.serial_critical_retry_count)
+            _require_value(serial_raw, "critical_retry_count", "sim2real.serial.critical_retry_count")
         ),
         serial_critical_retry_interval_sec=float(
-            serial_raw.get(
+            _require_value(
+                serial_raw,
                 "critical_retry_interval_sec",
-                defaults.bridge.serial_critical_retry_interval_sec,
+                "sim2real.serial.critical_retry_interval_sec",
             )
         ),
     )
 
-    per_motor_raw = actuator_raw.get("per_motor", None)
-    if per_motor_raw is None or not isinstance(per_motor_raw, Mapping):
-        raise ValueError("`sim2real.actuator.per_motor` must be a mapping and include m1~m4.")
-
-    id_by_motor_raw = actuator_raw.get("id_by_motor", None)
-    if id_by_motor_raw is None or not isinstance(id_by_motor_raw, Mapping):
-        raise ValueError("`sim2real.actuator.id_by_motor` must be a mapping and include m1~m4.")
+    per_motor_raw = _require_mapping(actuator_raw, "per_motor", "sim2real.actuator.per_motor")
+    id_by_motor_raw = _require_mapping(
+        actuator_raw,
+        "id_by_motor",
+        "sim2real.actuator.id_by_motor",
+    )
 
     actuator_cfg = ActuatorConfig(
-        mode=str(actuator_raw.get("mode", defaults.actuator.mode)),
-        ids=tuple(int(x) for x in actuator_raw.get("ids", defaults.actuator.ids)),
+        mode=str(_require_value(actuator_raw, "mode", "sim2real.actuator.mode")),
+        ids=tuple(int(x) for x in _require_value(actuator_raw, "ids", "sim2real.actuator.ids")),
         id_by_motor=_load_id_by_motor_cfg(id_by_motor_raw),
-        position_index=_coerce_int(actuator_raw.get("position_index", defaults.actuator.position_index)),
-        count_min=int(actuator_raw.get("count_min", defaults.actuator.count_min)),
-        count_max=int(actuator_raw.get("count_max", defaults.actuator.count_max)),
-        m1=_load_axis_map_cfg(per_motor_raw, "m1", defaults.actuator.m1),
-        m2=_load_axis_map_cfg(per_motor_raw, "m2", defaults.actuator.m2),
-        m3=_load_axis_map_cfg(per_motor_raw, "m3", defaults.actuator.m3),
-        m4=_load_axis_map_cfg(per_motor_raw, "m4", defaults.actuator.m4),
+        position_index=_coerce_int(
+            _require_value(actuator_raw, "position_index", "sim2real.actuator.position_index")
+        ),
+        count_min=int(_require_value(actuator_raw, "count_min", "sim2real.actuator.count_min")),
+        count_max=int(_require_value(actuator_raw, "count_max", "sim2real.actuator.count_max")),
+        m1=_load_axis_map_cfg(per_motor_raw, "m1"),
+        m2=_load_axis_map_cfg(per_motor_raw, "m2"),
+        m3=_load_axis_map_cfg(per_motor_raw, "m3"),
+        m4=_load_axis_map_cfg(per_motor_raw, "m4"),
     )
 
     alarm_cfg = EstopAlarmConfig(
-        enabled=bool(alarm_raw.get("enabled", defaults.alarm.enabled)),
-        repeat=int(alarm_raw.get("repeat", defaults.alarm.repeat)),
-        terminal_bell=bool(alarm_raw.get("terminal_bell", defaults.alarm.terminal_bell)),
-        banner_width=int(alarm_raw.get("banner_width", defaults.alarm.banner_width)),
+        enabled=bool(_require_value(alarm_raw, "enabled", "sim2real.alarm.enabled")),
+        repeat=int(_require_value(alarm_raw, "repeat", "sim2real.alarm.repeat")),
+        terminal_bell=bool(
+            _require_value(alarm_raw, "terminal_bell", "sim2real.alarm.terminal_bell")
+        ),
+        banner_width=int(_require_value(alarm_raw, "banner_width", "sim2real.alarm.banner_width")),
     )
 
     monitor_cfg = MonitorConfig(
-        enabled=bool(monitor_raw.get("enabled", defaults.monitor.enabled)),
-        query_hz=float(monitor_raw.get("query_hz", defaults.monitor.query_hz)),
+        enabled=bool(_require_value(monitor_raw, "enabled", "sim2real.monitor.enabled")),
+        query_hz=float(_require_value(monitor_raw, "query_hz", "sim2real.monitor.query_hz")),
         response_timeout_sec=float(
-            monitor_raw.get("response_timeout_sec", defaults.monitor.response_timeout_sec)
+            _require_value(
+                monitor_raw,
+                "response_timeout_sec",
+                "sim2real.monitor.response_timeout_sec",
+            )
         ),
         failure_threshold=int(
-            monitor_raw.get("failure_threshold", defaults.monitor.failure_threshold)
+            _require_value(
+                monitor_raw,
+                "failure_threshold",
+                "sim2real.monitor.failure_threshold",
+            )
         ),
-        error_mask=_coerce_int(monitor_raw.get("error_mask", defaults.monitor.error_mask)),
-        log_every_n=int(monitor_raw.get("log_every_n", defaults.monitor.log_every_n)),
+        error_mask=_coerce_int(_require_value(monitor_raw, "error_mask", "sim2real.monitor.error_mask")),
+        log_every_n=int(_require_value(monitor_raw, "log_every_n", "sim2real.monitor.log_every_n")),
     )
 
     output_cfg = MotorOutputConfig(
-        print_tx_frame=bool(output_raw.get("print_tx_frame", defaults.output.print_tx_frame)),
-        print_every_n=int(output_raw.get("print_every_n", defaults.output.print_every_n)),
-        save_csv=bool(output_raw.get("save_csv", defaults.output.save_csv)),
-        csv_path=str(output_raw.get("csv_path", defaults.output.csv_path)),
-        save_plot=bool(output_raw.get("save_plot", defaults.output.save_plot)),
-        plot_path=str(output_raw.get("plot_path", defaults.output.plot_path)),
-        plot_dpi=int(output_raw.get("plot_dpi", defaults.output.plot_dpi)),
-        max_plot_points=int(output_raw.get("max_plot_points", defaults.output.max_plot_points)),
+        print_tx_frame=bool(_require_value(output_raw, "print_tx_frame", "sim2real.output.print_tx_frame")),
+        print_every_n=int(_require_value(output_raw, "print_every_n", "sim2real.output.print_every_n")),
+        save_csv=bool(_require_value(output_raw, "save_csv", "sim2real.output.save_csv")),
+        csv_path=str(_require_value(output_raw, "csv_path", "sim2real.output.csv_path")),
+        save_plot=bool(_require_value(output_raw, "save_plot", "sim2real.output.save_plot")),
+        plot_path=str(_require_value(output_raw, "plot_path", "sim2real.output.plot_path")),
+        plot_dpi=int(_require_value(output_raw, "plot_dpi", "sim2real.output.plot_dpi")),
+        max_plot_points=int(
+            _require_value(output_raw, "max_plot_points", "sim2real.output.max_plot_points")
+        ),
     )
 
     return DaggerSim2RealRuntimeConfig(
@@ -1236,10 +1227,25 @@ def _load_id_by_motor_cfg(raw: Mapping[str, Any]) -> Dict[str, int]:
     return out
 
 
+def _require_value(raw: Mapping[str, Any], key: str, path: str) -> Any:
+    if key not in raw:
+        raise ValueError(f"`{path}` is required.")
+    value = raw[key]
+    if value is None:
+        raise ValueError(f"`{path}` must not be null.")
+    return value
+
+
+def _require_mapping(raw: Mapping[str, Any], key: str, path: str) -> Mapping[str, Any]:
+    value = _require_value(raw, key, path)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"`{path}` must be a mapping/object.")
+    return value
+
+
 def _load_axis_map_cfg(
     per_motor_raw: Mapping[str, Any],
     axis_name: str,
-    defaults: MotorAxisMapConfig,
 ) -> MotorAxisMapConfig:
     axis_raw = per_motor_raw.get(axis_name, None)
     if axis_raw is None:
@@ -1248,9 +1254,39 @@ def _load_axis_map_cfg(
         raise ValueError(f"`sim2real.actuator.per_motor.{axis_name}` must be a mapping/object.")
 
     return MotorAxisMapConfig(
-        zero_count=int(axis_raw.get("zero_count", defaults.zero_count)),
-        count_per_mm=float(axis_raw.get("count_per_mm", defaults.count_per_mm)),
-        sign=int(axis_raw.get("sign", defaults.sign)),
-        soft_min_count=int(axis_raw.get("soft_min_count", defaults.soft_min_count)),
-        soft_max_count=int(axis_raw.get("soft_max_count", defaults.soft_max_count)),
+        zero_count=int(
+            _require_value(
+                axis_raw,
+                "zero_count",
+                f"sim2real.actuator.per_motor.{axis_name}.zero_count",
+            )
+        ),
+        count_per_mm=float(
+            _require_value(
+                axis_raw,
+                "count_per_mm",
+                f"sim2real.actuator.per_motor.{axis_name}.count_per_mm",
+            )
+        ),
+        sign=int(
+            _require_value(
+                axis_raw,
+                "sign",
+                f"sim2real.actuator.per_motor.{axis_name}.sign",
+            )
+        ),
+        soft_min_count=int(
+            _require_value(
+                axis_raw,
+                "soft_min_count",
+                f"sim2real.actuator.per_motor.{axis_name}.soft_min_count",
+            )
+        ),
+        soft_max_count=int(
+            _require_value(
+                axis_raw,
+                "soft_max_count",
+                f"sim2real.actuator.per_motor.{axis_name}.soft_max_count",
+            )
+        ),
     )

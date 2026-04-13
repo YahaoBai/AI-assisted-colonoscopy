@@ -145,7 +145,7 @@ sim2real:
 
     # 仅滑台模式开关：true 时跳过电缸链路，仅保留手柄->滑台控制
     # 默认 false，确保原有“电缸+滑台”流程不受影响
-    allow_feed_without_actuator: true
+    allow_feed_without_actuator: false
 
   # =============================================================================
   # [Layer 5.5] 进给滑台（Feed Slider, Emm_V5）
@@ -167,8 +167,8 @@ sim2real:
     microstep: 16
     steps_per_rev: 200
 
-    # 前进一次的默认步长（pulses）
-    step_pulses: 200
+    # 前进一次的默认步长（pulses）3mm/s
+    step_pulses: 80
     # 手柄按住 Y 的连续发送频率（Hz）
     repeat_hz: 10.0
     # 位置控制速度/加速度参数
