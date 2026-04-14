@@ -10,11 +10,8 @@ class TeleopConfig:
     """
     teleop 运行时配置模型。
 
-    公开（推荐）参数面，仅 8 项：
+    公开（推荐）参数面：
     - controller_index
-    - deadzone
-    - max_yaw_rate_rad_s
-    - max_pitch_rate_rad_s
     - invert_yaw
     - invert_pitch
     - hold_sec
@@ -23,11 +20,8 @@ class TeleopConfig:
     其余字段用于内部默认或兼容旧配置，不建议新配置直接使用。
     """
 
-    # ---- Public 8 ----
+    # ---- Public ----
     controller_index: int = 0
-    deadzone: float = 0.15
-    max_yaw_rate_rad_s: float = 0.9
-    max_pitch_rate_rad_s: float = 0.9
     invert_yaw: bool = False
     invert_pitch: bool = True
     hold_sec: float = 1.0
@@ -57,9 +51,6 @@ class TeleopConfig:
         self.controller_index = int(self.controller_index)
         self.left_stick_x_axis = int(self.left_stick_x_axis)
         self.left_stick_y_axis = int(self.left_stick_y_axis)
-        self.deadzone = float(self.deadzone)
-        self.max_yaw_rate_rad_s = float(self.max_yaw_rate_rad_s)
-        self.max_pitch_rate_rad_s = float(self.max_pitch_rate_rad_s)
         self.invert_yaw = bool(self.invert_yaw)
         self.invert_pitch = bool(self.invert_pitch)
         self.hold_sec = float(self.hold_sec)
@@ -72,10 +63,6 @@ class TeleopConfig:
         self.disconnect_timeout_sec = float(self.disconnect_timeout_sec)
         self.deprecation_warnings = tuple(str(x) for x in self.deprecation_warnings)
 
-        if not (0.0 <= self.deadzone < 1.0):
-            raise ValueError("teleop.deadzone must be in [0, 1).")
-        if self.max_yaw_rate_rad_s < 0.0 or self.max_pitch_rate_rad_s < 0.0:
-            raise ValueError("teleop.max_*_rate_rad_s must be >= 0.")
         if self.hold_sec < 0.0:
             raise ValueError("teleop.hold_sec must be >= 0.")
         if self.estop_hold_sec < 0.0 or self.reset_hold_sec < 0.0:
@@ -134,15 +121,17 @@ def _build_effective_teleop_config(teleop_raw: Mapping[str, Any]) -> TeleopConfi
     defaults = TeleopConfig()
     warnings: list[str] = []
 
-    # ---- Public 8 ----
+    removed_fields = ("deadzone", "max_yaw_rate_rad_s", "max_pitch_rate_rad_s")
+    removed_hits = [name for name in removed_fields if name in teleop_raw]
+    if removed_hits:
+        text = ", ".join(removed_hits)
+        raise ValueError(
+            "Removed teleop fields are not supported: "
+            f"{text}. Teleop now uses direct mm mapping (no rate/deadzone params)."
+        )
+
+    # ---- Public ----
     controller_index = int(teleop_raw.get("controller_index", defaults.controller_index))
-    deadzone = float(teleop_raw.get("deadzone", defaults.deadzone))
-    max_yaw_rate_rad_s = float(
-        teleop_raw.get("max_yaw_rate_rad_s", defaults.max_yaw_rate_rad_s)
-    )
-    max_pitch_rate_rad_s = float(
-        teleop_raw.get("max_pitch_rate_rad_s", defaults.max_pitch_rate_rad_s)
-    )
     invert_yaw = bool(teleop_raw.get("invert_yaw", defaults.invert_yaw))
     invert_pitch = bool(teleop_raw.get("invert_pitch", defaults.invert_pitch))
     hold_sec = float(teleop_raw.get("hold_sec", defaults.hold_sec))
@@ -216,9 +205,6 @@ def _build_effective_teleop_config(teleop_raw: Mapping[str, Any]) -> TeleopConfi
 
     return TeleopConfig(
         controller_index=controller_index,
-        deadzone=deadzone,
-        max_yaw_rate_rad_s=max_yaw_rate_rad_s,
-        max_pitch_rate_rad_s=max_pitch_rate_rad_s,
         invert_yaw=invert_yaw,
         invert_pitch=invert_pitch,
         hold_sec=hold_sec,
@@ -239,7 +225,7 @@ def _build_effective_teleop_config(teleop_raw: Mapping[str, Any]) -> TeleopConfi
 
 def load_teleop_config(config_path: str | Path) -> TeleopConfig:
     """
-    从 YAML 加载 teleop 配置（公共 8 项 + 旧字段兼容）。
+    从 YAML 加载 teleop 配置（公共参数 + 部分旧字段兼容）。
     """
     teleop_raw = _load_raw_teleop_mapping(config_path)
     return _build_effective_teleop_config(teleop_raw)

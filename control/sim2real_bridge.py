@@ -249,6 +249,7 @@ class BridgeResult:
     yaw_accum_rad: float = 0.0
     pitch_accum_rad: float = 0.0
     reason: str = ""
+    motor_limit_new_hits: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -293,6 +294,7 @@ class Sim2RealBridge:
         self.motor_target_mm = np.zeros(4, dtype=np.float64)
         self.control_dt_accum = 0.0
         self.estop_latched = False
+        self.motor_limit_active = np.zeros(4, dtype=bool)
 
     def _make_estop(self, reason: str) -> BridgeResult:
         return BridgeResult(
@@ -330,11 +332,18 @@ class Sim2RealBridge:
         action = np.array([delta_yaw, delta_pitch], dtype=np.float64)
         motor_delta_mm = self.config.J_4x2_mm_per_rad @ action
 
-        self.motor_target_mm += motor_delta_mm
+        motor_target_candidate = self.motor_target_mm + motor_delta_mm
+        clipped_mask = np.abs(motor_target_candidate) > (self.motor_limit_mm + 1e-9)
+        new_hit_mask = clipped_mask & (~self.motor_limit_active)
+        self.motor_limit_active = clipped_mask
+
         self.motor_target_mm = np.clip(
-            self.motor_target_mm,
+            motor_target_candidate,
             -self.motor_limit_mm,
             self.motor_limit_mm,
+        )
+        new_hit_motors = tuple(
+            MOTOR_NAME_SET[idx] for idx, is_new_hit in enumerate(new_hit_mask.tolist()) if is_new_hit
         )
 
         should_send = False
@@ -351,6 +360,7 @@ class Sim2RealBridge:
             motor_target_mm=self.motor_target_mm.copy(),
             yaw_accum_rad=self.yaw_accum_rad,
             pitch_accum_rad=self.pitch_accum_rad,
+            motor_limit_new_hits=new_hit_motors,
         )
 
     def reset(self) -> None:
@@ -359,6 +369,7 @@ class Sim2RealBridge:
         self.motor_target_mm = np.zeros(4, dtype=np.float64)
         self.control_dt_accum = 0.0
         self.estop_latched = False
+        self.motor_limit_active = np.zeros(4, dtype=bool)
 
 
 class LAFrameBuilder:

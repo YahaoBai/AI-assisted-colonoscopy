@@ -14,7 +14,6 @@ except ImportError:  # pragma: no cover - import guard only
 from control.sim2real_bridge import (
     ActuatorMonitor,
     ActuatorTx,
-    BridgeCommand,
     FaultClearVerification,
     MotorMapper,
     Sim2RealBridge,
@@ -31,9 +30,7 @@ from control.feed import (
 )
 from control.teleop_common import (
     HoldLatch,
-    axis_to_rate,
-    log_event,
-    should_send_follow_command,
+    log_event as _base_log_event,
     should_trigger_disconnect_estop,
 )
 from control.teleop_config import load_teleop_config
@@ -43,6 +40,34 @@ DEBUG_INPUT_HZ_DEFAULT = 5.0
 FEED_RESET_DISABLE_SETTLE_SEC = 0.15
 FEED_RESET_ENABLE_SETTLE_SEC = 0.15
 FEED_POST_RESET_PREMOVE_SETTLE_SEC = 0.10
+_ESTOP_LOG_FREEZE = False
+
+
+def _set_estop_log_freeze(enabled: bool) -> None:
+    global _ESTOP_LOG_FREEZE
+    _ESTOP_LOG_FREEZE = bool(enabled)
+
+
+def log_event(event: str, force: bool = False, **fields: Any) -> None:
+    """
+    Teleop 日志封装：急停后默认静默，除非 force=True。
+    """
+    if _ESTOP_LOG_FREEZE and (not force):
+        return
+    _base_log_event(event, **fields)
+
+
+def _print_estop_banner(reason: str, actuator_id: Optional[int], error_bits: Optional[int]) -> None:
+    """
+    急停提示横幅：要求使用 !!! 前后包裹，便于终端快速定位。
+    """
+    parts = [f"reason={reason}"]
+    if actuator_id is not None:
+        parts.append(f"actuator_id={int(actuator_id)}")
+    if error_bits is not None:
+        parts.append(f"error_bits=0x{int(error_bits):02X}")
+    text = " ".join(parts)
+    print(f"!!! ESTOP_LATCHED {text} !!!")
 
 
 @dataclass
@@ -102,6 +127,7 @@ class TeleopLoopState:
     last_debug_pitch_rate: float
     last_debug_estop_latched: bool
     last_debug_motor_counts: Optional[Tuple[int, int, int, int]]
+    last_motor_limit_active: Tuple[bool, bool, bool, bool]
 
 
 def send_follow_target_mm(
@@ -551,12 +577,11 @@ def _latch_estop(
         return False
 
     ctx.sim2real_bridge.estop_latched = True
-    payload: dict[str, Any] = {"reason": reason}
-    if actuator_id is not None:
-        payload["actuator_id"] = actuator_id
-    if error_bits is not None:
-        payload["error_bits"] = f"0x{int(error_bits):02X}"
-    log_event("ESTOP_LATCHED", **payload)
+    _print_estop_banner(reason=reason, actuator_id=actuator_id, error_bits=error_bits)
+    _set_estop_log_freeze(True)
+
+    if ctx.actuator_monitor is not None:
+        ctx.actuator_monitor.set_active(False)
 
     if ctx.actuator_tx is not None:
         ctx.actuator_tx.send_estop_all(ctx.actuator_ids, critical=True)
@@ -572,6 +597,7 @@ def _run_boot_reset(ctx: TeleopRuntimeContext) -> None:
     """
     启动阶段执行一次复位流程。
     """
+    log_event("BOOT_RESET_START", mode="DRY_RUN" if ctx.dry_run else "HARDWARE")
     ok, reason = perform_reset_sequence(
         actuator_tx=ctx.actuator_tx,
         actuator_monitor=ctx.actuator_monitor,
@@ -610,6 +636,7 @@ def _create_loop_state(control_hz: float) -> TeleopLoopState:
         last_debug_pitch_rate=0.0,
         last_debug_estop_latched=False,
         last_debug_motor_counts=None,
+        last_motor_limit_active=(False, False, False, False),
     )
 
 
@@ -740,6 +767,7 @@ def _handle_manual_estop_and_reset(
         allow_feed_without_actuator=ctx.allow_feed_without_actuator,
     )
     if ok:
+        _set_estop_log_freeze(False)
         log_event("RESET_SUCCESS")
     else:
         ctx.sim2real_bridge.estop_latched = True
@@ -774,32 +802,39 @@ def _sync_monitor_active_state(ctx: TeleopRuntimeContext) -> None:
         ctx.actuator_monitor.set_active(not ctx.sim2real_bridge.estop_latched)
 
 
-def _compute_control_delta(
+def _compute_direct_motor_target_mm(
     sample: GamepadSample,
     teleop_cfg: Any,
-    dt: float,
-) -> Tuple[float, float, float, float]:
+    motor_limit_mm: float,
+) -> Tuple[float, float, np.ndarray, Tuple[bool, bool, bool, bool]]:
     """
-    从手柄轴值计算速率与角度增量。
+    从手柄轴值直接映射四电缸 mm 目标（不经过桥接 step 积分）。
 
     返回:
-        (yaw_rate, pitch_rate, delta_yaw, delta_pitch)
+        (yaw_cmd_mm, pitch_cmd_mm, motor_target_mm, motor_limit_active)
     """
-    yaw_rate = axis_to_rate(
-        raw_axis=sample.axis_x,
-        deadzone=teleop_cfg.deadzone,
-        max_rate_rad_s=teleop_cfg.max_yaw_rate_rad_s,
-        invert=teleop_cfg.invert_yaw,
+    yaw_axis = float(np.clip(float(sample.axis_x), -1.0, 1.0))
+    pitch_axis = float(np.clip(float(sample.axis_y), -1.0, 1.0))
+    if teleop_cfg.invert_yaw:
+        yaw_axis = -yaw_axis
+    if teleop_cfg.invert_pitch:
+        pitch_axis = -pitch_axis
+
+    limit_mm = max(0.0, float(motor_limit_mm))
+
+    yaw_cmd_mm = yaw_axis * limit_mm
+    pitch_cmd_mm = pitch_axis * limit_mm
+
+    # 固定对称映射：
+    # yaw:   m1=+sx, m3=-sx
+    # pitch: m2=+sy, m4=-sy
+    raw_target = np.asarray(
+        [yaw_cmd_mm, pitch_cmd_mm, -yaw_cmd_mm, -pitch_cmd_mm],
+        dtype=np.float64,
     )
-    pitch_rate = axis_to_rate(
-        raw_axis=sample.axis_y,
-        deadzone=teleop_cfg.deadzone,
-        max_rate_rad_s=teleop_cfg.max_pitch_rate_rad_s,
-        invert=teleop_cfg.invert_pitch,
-    )
-    delta_yaw = yaw_rate * dt
-    delta_pitch = pitch_rate * dt
-    return yaw_rate, pitch_rate, delta_yaw, delta_pitch
+    motor_target_mm = np.clip(raw_target, -limit_mm, limit_mm)
+    active = tuple(bool(abs(v) >= (limit_mm - 1e-9)) for v in raw_target.tolist())
+    return yaw_cmd_mm, pitch_cmd_mm, motor_target_mm, active
 
 
 def _maybe_log_debug_snapshot(
@@ -878,25 +913,37 @@ def _maybe_log_debug_snapshot(
     loop_state.last_debug_motor_counts = motor_counts
 
 
-def _step_bridge_and_send(
-    delta_yaw: float,
-    delta_pitch: float,
-    dt: float,
+def _send_direct_target_and_check_limits(
+    motor_target_mm: np.ndarray,
+    motor_limit_active: Tuple[bool, bool, bool, bool],
+    loop_state: TeleopLoopState,
     ctx: TeleopRuntimeContext,
 ) -> None:
     """
-    执行桥接一步并在允许时发送 F3 跟随帧。
+    发送 direct mm 目标并处理限幅命中日志。
     """
-    bridge_result = ctx.sim2real_bridge.step(delta_yaw, delta_pitch, dt)
-    if bridge_result.command == BridgeCommand.ESTOP:
-        _latch_estop(ctx, reason=bridge_result.reason or "BRIDGE_ESTOP")
+    prev_active = np.asarray(loop_state.last_motor_limit_active, dtype=bool)
+    current_active = np.asarray(motor_limit_active, dtype=bool)
+    new_hits = current_active & (~prev_active)
+    if np.any(new_hits):
+        id_by_motor = ctx.motor_mapper.actuator_cfg.id_by_motor
+        motor_names = ("m1", "m2", "m3", "m4")
+        hit_text = ",".join(
+            f"{name}(id={id_by_motor.get(name, '?')})"
+            for name, is_hit in zip(motor_names, new_hits.tolist())
+            if is_hit
+        )
+        log_event(
+            "MOTOR_LIMIT_HIT",
+            limit_mm=f"{ctx.sim2real_bridge.motor_limit_mm:.3f}",
+            motors=hit_text,
+        )
+    loop_state.last_motor_limit_active = tuple(bool(x) for x in current_active.tolist())
 
-    if not should_send_follow_command(
-        command=bridge_result.command,
-        should_send_flag=bridge_result.should_send,
-        estop_latched=ctx.sim2real_bridge.estop_latched,
-    ):
+    if ctx.sim2real_bridge.estop_latched:
         return
+
+    ctx.sim2real_bridge.motor_target_mm = np.asarray(motor_target_mm, dtype=np.float64)
 
     if ctx.dry_run:
         return
@@ -906,7 +953,7 @@ def _step_bridge_and_send(
         actuator_tx=ctx.actuator_tx,
         motor_mapper=ctx.motor_mapper,
         actuator_ids=ctx.actuator_ids,
-        motor_target_mm=bridge_result.motor_target_mm,
+        motor_target_mm=ctx.sim2real_bridge.motor_target_mm,
         frame_name="F3_FOLLOW",
         critical=False,
     )
@@ -993,6 +1040,7 @@ def run_teleop(
     """
     teleop 主流程。
     """
+    _set_estop_log_freeze(False)
     runtime_cfg = load_dagger_sim2real_runtime_config(config_path)
     teleop_cfg = load_teleop_config(config_path)
     feed_only_mode = bool(teleop_cfg.allow_feed_without_actuator)
@@ -1058,7 +1106,7 @@ def run_teleop(
 
         while True:
             loop_start = time.monotonic()
-            dt = _compute_loop_dt(loop_state, loop_start)
+            _ = _compute_loop_dt(loop_state, loop_start)
 
             sample = gamepad.poll()
             _update_forward_state_and_feed(sample, loop_state, ctx, loop_start)
@@ -1068,30 +1116,33 @@ def run_teleop(
             _sync_monitor_active_state(ctx)
 
             if feed_only_mode:
-                yaw_rate, pitch_rate, delta_yaw, delta_pitch = 0.0, 0.0, 0.0, 0.0
+                yaw_cmd_mm = 0.0
+                pitch_cmd_mm = 0.0
+                motor_target_mm = np.zeros(4, dtype=np.float64)
+                motor_limit_active = (False, False, False, False)
             else:
-                yaw_rate, pitch_rate, delta_yaw, delta_pitch = _compute_control_delta(
+                yaw_cmd_mm, pitch_cmd_mm, motor_target_mm, motor_limit_active = _compute_direct_motor_target_mm(
                     sample=sample,
                     teleop_cfg=teleop_cfg,
-                    dt=dt,
+                    motor_limit_mm=ctx.sim2real_bridge.motor_limit_mm,
                 )
             _maybe_log_debug_snapshot(
                 enabled=debug_input,
                 loop_start=loop_start,
                 sample=sample,
-                yaw_rate=yaw_rate,
-                pitch_rate=pitch_rate,
-                delta_yaw=delta_yaw,
-                delta_pitch=delta_pitch,
+                yaw_rate=yaw_cmd_mm,
+                pitch_rate=pitch_cmd_mm,
+                delta_yaw=0.0,
+                delta_pitch=0.0,
                 estop_latched=ctx.sim2real_bridge.estop_latched,
                 loop_state=loop_state,
                 ctx=ctx,
             )
             if not feed_only_mode:
-                _step_bridge_and_send(
-                    delta_yaw=delta_yaw,
-                    delta_pitch=delta_pitch,
-                    dt=dt,
+                _send_direct_target_and_check_limits(
+                    motor_target_mm=motor_target_mm,
+                    motor_limit_active=motor_limit_active,
+                    loop_state=loop_state,
                     ctx=ctx,
                 )
             _sleep_for_rate(loop_start, loop_state.period_sec)

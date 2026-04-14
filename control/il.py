@@ -262,6 +262,77 @@ def send_fault_clear_all_critical() -> bool:
     return actuator_tx.send_fault_clear_all(actuator_ids, critical=True)
 
 
+def run_reset_sequence(trigger: str) -> bool:
+    """
+    执行一次电缸复位流程：
+    fault_clear -> work_start -> follow_zero -> verify -> bridge.reset
+    """
+    actuator_monitor.set_active(False)
+    key_states['autopilot_on'] = False
+
+    fault_clear_ok = send_fault_clear_all_critical()
+    work_start_ok = fault_clear_ok and send_work_start_all_critical()
+    zero_ok = (
+        work_start_ok
+        and send_follow_target_mm(
+            np.zeros(4, dtype=np.float64),
+            frame_name="F3_FOLLOW_ZERO",
+            critical=True,
+        )
+    )
+
+    verify_result = None
+    if fault_clear_ok and work_start_ok and zero_ok:
+        verify_result = actuator_monitor.verify_fault_clear(
+            actuator_ids=actuator_ids,
+            attempts=2,
+            settle_time_sec=max(0.01, monitor_cfg.response_timeout_sec),
+        )
+
+    if (
+        fault_clear_ok
+        and work_start_ok
+        and zero_ok
+        and verify_result is not None
+        and verify_result.ok
+    ):
+        sim2real_bridge.reset()
+        actuator_monitor.clear_fault()
+        print(f">>> [Sim2Real] {trigger}：电缸故障/急停已清除，累计角归零并下发零位。")
+        return True
+
+    sim2real_bridge.estop_latched = True
+    detail_parts = []
+    if verify_result is not None:
+        if verify_result.failures_by_id:
+            detail_parts.append(
+                "状态复查失败: "
+                + ", ".join(
+                    f"id={aid}:{reason}"
+                    for aid, reason in sorted(verify_result.failures_by_id.items())
+                )
+            )
+        if verify_result.uncleared_error_bits_by_id:
+            detail_parts.append(
+                "故障位仍存在: "
+                + ", ".join(
+                    f"id={aid}:0x{bits:02X}"
+                    for aid, bits in sorted(verify_result.uncleared_error_bits_by_id.items())
+                )
+                + "，可能仍处于过温等硬件保护状态"
+            )
+
+    detail_suffix = ""
+    if detail_parts:
+        detail_suffix = " " + "；".join(detail_parts)
+
+    print(
+        f"❌ [Sim2Real] {trigger}：故障清除/RESET/回零未完成，已保持锁存。"
+        f"{detail_suffix} 请检查硬件状态后按 [R] 重试。"
+    )
+    return False
+
+
 shutdown_estop_done = False
 
 
@@ -440,6 +511,11 @@ print("     结肠镜仿真系统 ")
 print("  [5] 自动模式开关 | [R] 清除角度锁存急停")
 print("="*60 + "\n")
 
+if run_reset_sequence("启动自动复位"):
+    print(">>> [Sim2Real] 启动自动复位完成，可直接开始控制。")
+else:
+    print(">>> [Sim2Real] 启动自动复位失败，系统保持锁存；按 [R] 可重试。")
+
 try:
     with mujoco.viewer.launch_passive(model, data) as viewer:
         viewer.cam.fixedcamid = camera_id
@@ -462,69 +538,7 @@ try:
                 if not sim2real_bridge.estop_latched:
                     print(">>> [Sim2Real] 当前未处于急停锁存，已忽略 [R]，避免误触发工作启动/回零。")
                 else:
-                    actuator_monitor.set_active(False)
-                    key_states['autopilot_on'] = False
-                    fault_clear_ok = send_fault_clear_all_critical()
-                    work_start_ok = fault_clear_ok and send_work_start_all_critical()
-                    zero_ok = (
-                        work_start_ok
-                        and send_follow_target_mm(
-                            np.zeros(4, dtype=np.float64),
-                            frame_name="F3_FOLLOW_ZERO",
-                            critical=True,
-                        )
-                    )
-                    verify_result = None
-                    if fault_clear_ok and work_start_ok and zero_ok:
-                        verify_result = actuator_monitor.verify_fault_clear(
-                            actuator_ids=actuator_ids,
-                            attempts=2,
-                            settle_time_sec=max(0.01, monitor_cfg.response_timeout_sec),
-                        )
-
-                    if (
-                        fault_clear_ok
-                        and work_start_ok
-                        and zero_ok
-                        and verify_result is not None
-                        and verify_result.ok
-                    ):
-                        sim2real_bridge.reset()
-                        actuator_monitor.clear_fault()
-                        print(">>> [Sim2Real] 已清除电缸故障/急停锁存，累计角归零并下发零位。")
-                    else:
-                        sim2real_bridge.estop_latched = True
-                        key_states['autopilot_on'] = False
-                        detail_parts = []
-                        if verify_result is not None:
-                            if verify_result.failures_by_id:
-                                detail_parts.append(
-                                    "状态复查失败: "
-                                    + ", ".join(
-                                        f"id={aid}:{reason}"
-                                        for aid, reason in sorted(verify_result.failures_by_id.items())
-                                    )
-                                )
-                            if verify_result.uncleared_error_bits_by_id:
-                                detail_parts.append(
-                                    "故障位仍存在: "
-                                    + ", ".join(
-                                        f"id={aid}:0x{bits:02X}"
-                                        for aid, bits in sorted(
-                                            verify_result.uncleared_error_bits_by_id.items()
-                                        )
-                                    )
-                                    + "，可能仍处于过温等硬件保护状态"
-                                )
-
-                        detail_suffix = ""
-                        if detail_parts:
-                            detail_suffix = " " + "；".join(detail_parts)
-
-                        print(
-                            "❌ [Sim2Real] 故障清除/RESET/回零未完成，已保持锁存。"
-                            f"{detail_suffix} 请检查硬件状态后按 [R] 重试。"
-                        )
+                    run_reset_sequence("手动复位")
 
             if sim2real_bridge.estop_latched and key_states['autopilot_on']:
                 key_states['autopilot_on'] = False
@@ -610,6 +624,15 @@ try:
                     #print(f">>> [实时延迟] U-Net感知 -> Policy决策: {latency_ms:.2f} ms")
 
                     bridge_result = sim2real_bridge.step(step_yaw, step_pitch, dt)
+                    if len(bridge_result.motor_limit_new_hits) > 0:
+                        hit_text = ", ".join(
+                            f"{motor}(id={actuator_cfg.id_by_motor.get(motor, '?')})"
+                            for motor in bridge_result.motor_limit_new_hits
+                        )
+                        print(
+                            f"[{frame_count}] [Sim2Real] 电机位移触发限幅 "
+                            f"limit={sim2real_bridge.motor_limit_mm:.3f}mm | motors={hit_text}"
+                        )
 
                     if bridge_result.command == BridgeCommand.ESTOP:
                         actuator_monitor.set_active(False)

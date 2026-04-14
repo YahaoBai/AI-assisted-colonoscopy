@@ -14,8 +14,6 @@ from control.teleop import (
     HoldLatch,
     PygameGamepadInput,
     TeleopConfig,
-    apply_deadzone,
-    axis_to_rate,
     build_arg_parser,
     load_teleop_config,
     perform_reset_sequence,
@@ -130,6 +128,7 @@ class FakeRuntimeBridge:
         _ = kwargs
         self.estop_latched = False
         self.motor_target_mm = np.zeros(4, dtype=np.float64)
+        self.motor_limit_mm = 8.0
         self.reset_called = 0
 
     def reset(self) -> None:
@@ -251,18 +250,39 @@ class TeleopCoreTests(unittest.TestCase):
             output=SimpleNamespace(print_tx_frame=False),
         )
 
-    def test_apply_deadzone_and_rescale(self) -> None:
-        self.assertAlmostEqual(apply_deadzone(0.10, 0.15), 0.0)
-        self.assertAlmostEqual(apply_deadzone(-0.10, 0.15), 0.0)
-        # (0.30 - 0.15) / (1 - 0.15) = 0.17647...
-        self.assertAlmostEqual(apply_deadzone(0.30, 0.15), 0.1764705882, places=7)
+    def test_direct_mm_mapping_symmetric(self) -> None:
+        cfg = TeleopConfig(invert_yaw=False, invert_pitch=False)
+        sample = SimpleNamespace(axis_x=1.0, axis_y=0.5)
+        yaw_mm, pitch_mm, target_mm, active = tr._compute_direct_motor_target_mm(
+            sample=sample,
+            teleop_cfg=cfg,
+            motor_limit_mm=8.0,
+        )
+        self.assertAlmostEqual(yaw_mm, 8.0)
+        self.assertAlmostEqual(pitch_mm, 4.0)
+        np.testing.assert_allclose(
+            target_mm,
+            np.asarray([8.0, 4.0, -8.0, -4.0], dtype=np.float64),
+            atol=1e-9,
+        )
+        self.assertEqual(active, (True, False, True, False))
 
-    def test_axis_to_rate_with_invert(self) -> None:
-        rate = axis_to_rate(raw_axis=0.50, deadzone=0.10, max_rate_rad_s=0.9, invert=False)
-        self.assertGreater(rate, 0.0)
-
-        rate_inv = axis_to_rate(raw_axis=0.50, deadzone=0.10, max_rate_rad_s=0.9, invert=True)
-        self.assertAlmostEqual(rate_inv, -rate, places=7)
+    def test_direct_mm_mapping_with_invert(self) -> None:
+        cfg = TeleopConfig(invert_yaw=True, invert_pitch=True)
+        sample = SimpleNamespace(axis_x=0.25, axis_y=-0.5)
+        yaw_mm, pitch_mm, target_mm, active = tr._compute_direct_motor_target_mm(
+            sample=sample,
+            teleop_cfg=cfg,
+            motor_limit_mm=8.0,
+        )
+        self.assertAlmostEqual(yaw_mm, -2.0)
+        self.assertAlmostEqual(pitch_mm, 4.0)
+        np.testing.assert_allclose(
+            target_mm,
+            np.asarray([-2.0, 4.0, 2.0, -4.0], dtype=np.float64),
+            atol=1e-9,
+        )
+        self.assertEqual(active, (False, False, False, False))
 
     def test_input_axis_normalization_supports_sdl_int_range(self) -> None:
         self.assertAlmostEqual(PygameGamepadInput._normalize_axis_value(0.5), 0.5)
@@ -675,9 +695,9 @@ class TeleopCoreTests(unittest.TestCase):
         ) as mock_setup_feed, patch(
             "control.teleop_runtime._run_boot_reset"
         ) as mock_boot_reset, patch(
-            "control.teleop_runtime._compute_control_delta"
-        ) as mock_compute_delta, patch(
-            "control.teleop_runtime._step_bridge_and_send"
+            "control.teleop_runtime._compute_direct_motor_target_mm"
+        ) as mock_compute_target, patch(
+            "control.teleop_runtime._send_direct_target_and_check_limits"
         ) as mock_bridge_send, patch(
             "control.teleop_runtime._sleep_for_rate",
             return_value=None,
@@ -692,7 +712,7 @@ class TeleopCoreTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         mock_setup_actuator.assert_not_called()
         mock_boot_reset.assert_not_called()
-        mock_compute_delta.assert_not_called()
+        mock_compute_target.assert_not_called()
         mock_bridge_send.assert_not_called()
         self.assertEqual(mock_setup_feed.call_count, 1)
         self.assertFalse(mock_setup_feed.call_args.kwargs["check_port_conflict"])
@@ -726,10 +746,15 @@ class TeleopCoreTests(unittest.TestCase):
         ) as mock_setup_feed, patch(
             "control.teleop_runtime._run_boot_reset"
         ) as mock_boot_reset, patch(
-            "control.teleop_runtime._compute_control_delta",
-            return_value=(0.1, 0.1, 0.01, 0.01),
-        ) as mock_compute_delta, patch(
-            "control.teleop_runtime._step_bridge_and_send"
+            "control.teleop_runtime._compute_direct_motor_target_mm",
+            return_value=(
+                0.1,
+                0.1,
+                np.zeros(4, dtype=np.float64),
+                (False, False, False, False),
+            ),
+        ) as mock_compute_target, patch(
+            "control.teleop_runtime._send_direct_target_and_check_limits"
         ) as mock_bridge_send, patch(
             "control.teleop_runtime._sleep_for_rate",
             return_value=None,
@@ -744,7 +769,7 @@ class TeleopCoreTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(mock_setup_actuator.call_count, 1)
         self.assertEqual(mock_boot_reset.call_count, 1)
-        self.assertGreaterEqual(mock_compute_delta.call_count, 1)
+        self.assertGreaterEqual(mock_compute_target.call_count, 1)
         self.assertGreaterEqual(mock_bridge_send.call_count, 1)
         self.assertEqual(mock_setup_feed.call_count, 1)
         self.assertTrue(mock_setup_feed.call_args.kwargs["check_port_conflict"])
@@ -759,15 +784,12 @@ class TeleopConfigCompatTests(unittest.TestCase):
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
         return path
 
-    def test_load_teleop_config_public_8_fields(self) -> None:
+    def test_load_teleop_config_public_fields(self) -> None:
         path = self._write_yaml(
             """
             sim2real:
               teleop:
                 controller_index: 2
-                deadzone: 0.2
-                max_yaw_rate_rad_s: 1.1
-                max_pitch_rate_rad_s: 1.2
                 invert_yaw: true
                 invert_pitch: false
                 hold_sec: 0.7
@@ -776,9 +798,6 @@ class TeleopConfigCompatTests(unittest.TestCase):
         )
         cfg = load_teleop_config(path)
         self.assertEqual(cfg.controller_index, 2)
-        self.assertAlmostEqual(cfg.deadzone, 0.2)
-        self.assertAlmostEqual(cfg.max_yaw_rate_rad_s, 1.1)
-        self.assertAlmostEqual(cfg.max_pitch_rate_rad_s, 1.2)
         self.assertTrue(cfg.invert_yaw)
         self.assertFalse(cfg.invert_pitch)
         self.assertAlmostEqual(cfg.hold_sec, 0.7)
@@ -789,6 +808,20 @@ class TeleopConfigCompatTests(unittest.TestCase):
         self.assertEqual(cfg.reset_combo, ("west", "west"))
         self.assertFalse(cfg.allow_feed_without_actuator)
         self.assertEqual(cfg.deprecation_warnings, ())
+
+    def test_load_teleop_config_removed_rate_fields_raise(self) -> None:
+        path = self._write_yaml(
+            """
+            sim2real:
+              teleop:
+                deadzone: 0.2
+                max_yaw_rate_rad_s: 1.1
+            """
+        )
+        with self.assertRaises(ValueError) as ctx:
+            load_teleop_config(path)
+        self.assertIn("deadzone", str(ctx.exception))
+        self.assertIn("max_yaw_rate_rad_s", str(ctx.exception))
 
     def test_load_teleop_config_allow_feed_without_actuator_true(self) -> None:
         path = self._write_yaml(
