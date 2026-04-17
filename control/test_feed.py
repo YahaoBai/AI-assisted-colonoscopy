@@ -2,6 +2,7 @@ import os
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 from control.feed import (
     CHK,
@@ -9,9 +10,9 @@ from control.feed import (
     build_arg_parser,
     build_en_control_frame,
     build_pos_control_frame,
-    compute_next_forward_target,
+    run_feed,
     resolve_feed_config,
-    resolve_forward_dir,
+    resolve_direction_flag,
 )
 
 
@@ -52,28 +53,9 @@ class FeedProtocolTests(unittest.TestCase):
         )
         self.assertEqual(frame, expected)
 
-    def test_resolve_forward_dir(self) -> None:
-        self.assertEqual(resolve_forward_dir(False), 0)
-        self.assertEqual(resolve_forward_dir(True), 1)
-
-    def test_compute_next_forward_target_limit_reject(self) -> None:
-        ok, next_p = compute_next_forward_target(
-            current_pulses=900,
-            step_pulses=200,
-            min_pulses=0,
-            max_pulses=1000,
-        )
-        self.assertFalse(ok)
-        self.assertEqual(next_p, 900)
-
-        ok2, next_p2 = compute_next_forward_target(
-            current_pulses=700,
-            step_pulses=200,
-            min_pulses=0,
-            max_pulses=1000,
-        )
-        self.assertTrue(ok2)
-        self.assertEqual(next_p2, 900)
+    def test_resolve_direction_flag(self) -> None:
+        self.assertEqual(resolve_direction_flag(True), 0)
+        self.assertEqual(resolve_direction_flag(False), 1)
 
 
 class FeedConfigTests(unittest.TestCase):
@@ -100,11 +82,7 @@ class FeedConfigTests(unittest.TestCase):
                 repeat_hz: 8.5
                 default_vel: 120
                 default_acc: 8
-                invert_dir: true
-                min_pulses: 0
-                max_pulses: 5000
                 enable_on_start: true
-                disable_on_exit: true
                 teleop_enabled: true
             """
         )
@@ -118,9 +96,6 @@ class FeedConfigTests(unittest.TestCase):
         self.assertAlmostEqual(cfg.repeat_hz, 8.5)
         self.assertEqual(cfg.default_vel, 120)
         self.assertEqual(cfg.default_acc, 8)
-        self.assertTrue(cfg.invert_dir)
-        self.assertEqual(cfg.min_pulses, 0)
-        self.assertEqual(cfg.max_pulses, 5000)
         self.assertTrue(cfg.teleop_enabled)
         self.assertTrue(cfg.dry_run)
 
@@ -130,6 +105,18 @@ class FeedConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             FeedConfig(repeat_hz=101.0).validate()
 
+    def test_resolve_feed_config_rejects_removed_legacy_fields(self) -> None:
+        path = self._write_yaml(
+            """
+            sim2real:
+              feed:
+                invert_dir: true
+            """
+        )
+        with self.assertRaises(ValueError) as ctx:
+            resolve_feed_config(dry_run=True, config_path=path)
+        self.assertIn("invert_dir", str(ctx.exception))
+
 
 class FeedCliTests(unittest.TestCase):
     def test_parser_supports_minimal_cli_surface(self) -> None:
@@ -137,6 +124,17 @@ class FeedCliTests(unittest.TestCase):
         args = parser.parse_args(["--list-ports", "--dry-run"])
         self.assertTrue(args.list_ports)
         self.assertTrue(args.dry_run)
+
+    def test_run_feed_keyboard_interrupt_does_not_disable_on_exit(self) -> None:
+        cfg = FeedConfig(dry_run=True, enable_on_start=True)
+        cfg.validate()
+        with patch("builtins.input", side_effect=KeyboardInterrupt()), patch(
+            "control.feed._send_enable",
+            return_value=True,
+        ) as mock_enable:
+            rc = run_feed(cfg)
+        self.assertEqual(rc, 130)
+        self.assertEqual(mock_enable.call_count, 1)
 
 
 if __name__ == "__main__":

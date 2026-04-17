@@ -7,6 +7,7 @@
 
 交互命令:
 - f            前进一次（+step_pulses，相对模式）
+- b            后退一次（-step_pulses，相对模式）
 - h            打印帮助
 
 CLI 参数:
@@ -15,7 +16,7 @@ CLI 参数:
 
 退出策略:
 - 仅支持 Ctrl+C 退出。
-- 退出时自动发送失能命令（可由 YAML 配置控制）。
+- 退出时仅释放串口，不主动下发失能。
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, Tuple
+from typing import Any, Mapping, Optional, Protocol
 
 try:
     import serial
@@ -65,13 +66,8 @@ class FeedConfig:
     repeat_hz: float = 10.0
     default_vel: int = 100
     default_acc: int = 0
-    invert_dir: bool = False
-
-    min_pulses: int = 0
-    max_pulses: int = 200000
 
     enable_on_start: bool = True
-    disable_on_exit: bool = True
     teleop_enabled: bool = False
 
     dry_run: bool = False
@@ -87,10 +83,7 @@ class FeedConfig:
         self.repeat_hz = float(self.repeat_hz)
         self.default_vel = int(self.default_vel)
         self.default_acc = int(self.default_acc)
-        self.min_pulses = int(self.min_pulses)
-        self.max_pulses = int(self.max_pulses)
         self.enable_on_start = bool(self.enable_on_start)
-        self.disable_on_exit = bool(self.disable_on_exit)
         self.teleop_enabled = bool(self.teleop_enabled)
         self.dry_run = bool(self.dry_run)
 
@@ -112,8 +105,6 @@ class FeedConfig:
             raise ValueError("feed.default_vel must be in [0, 65535]")
         if not (0 <= self.default_acc <= 0xFF):
             raise ValueError("feed.default_acc must be in [0, 255]")
-        if self.min_pulses > self.max_pulses:
-            raise ValueError("feed.min_pulses must be <= feed.max_pulses")
 
 
 # -------------------------
@@ -198,26 +189,13 @@ def build_pos_control_frame(
     )
 
 
-def resolve_forward_dir(invert_dir: bool) -> int:
+def resolve_direction_flag(forward: bool) -> int:
     """
-    前进方向位。
-
-    - invert_dir=False -> dir=0
-    - invert_dir=True  -> dir=1
+    固定方向位:
+    - forward=True  -> dir=0（前进）
+    - forward=False -> dir=1（后退）
     """
-    return 1 if bool(invert_dir) else 0
-
-
-def compute_next_forward_target(
-    current_pulses: int,
-    step_pulses: int,
-    min_pulses: int,
-    max_pulses: int,
-) -> Tuple[bool, int]:
-    next_pulses = int(current_pulses) + int(step_pulses)
-    if next_pulses < int(min_pulses) or next_pulses > int(max_pulses):
-        return False, int(current_pulses)
-    return True, next_pulses
+    return 0 if bool(forward) else 1
 
 
 # -------------------------
@@ -283,6 +261,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def resolve_feed_config(dry_run: bool, config_path: str = DEFAULT_CONFIG_PATH) -> FeedConfig:
     feed_raw = _load_feed_raw(str(config_path))
+    removed_fields = ("invert_dir", "min_pulses", "max_pulses")
+    removed_hits = [name for name in removed_fields if name in feed_raw]
+    if removed_hits:
+        text = ", ".join(removed_hits)
+        raise ValueError(
+            "Removed feed fields are not supported: "
+            f"{text}. Feed now uses fixed direction (Y/B) and no software limit."
+        )
 
     cfg = FeedConfig(
         config_path=str(config_path),
@@ -296,11 +282,7 @@ def resolve_feed_config(dry_run: bool, config_path: str = DEFAULT_CONFIG_PATH) -
         repeat_hz=float(feed_raw.get("repeat_hz", 10.0)),
         default_vel=int(feed_raw.get("default_vel", 100)),
         default_acc=int(feed_raw.get("default_acc", 0)),
-        invert_dir=_coerce_bool(feed_raw.get("invert_dir", False), False),
-        min_pulses=int(feed_raw.get("min_pulses", 0)),
-        max_pulses=int(feed_raw.get("max_pulses", 200000)),
         enable_on_start=_coerce_bool(feed_raw.get("enable_on_start", True), True),
-        disable_on_exit=_coerce_bool(feed_raw.get("disable_on_exit", True), True),
         teleop_enabled=_coerce_bool(feed_raw.get("teleop_enabled", False), False),
         dry_run=bool(dry_run),
     )
@@ -377,12 +359,13 @@ def _send_enable(serial_link: Optional[SerialLink], cfg: FeedConfig, state: bool
     )
 
 
-def _send_forward_once(
+def _send_step_once(
     serial_link: Optional[SerialLink],
     cfg: FeedConfig,
     step_pulses: int,
+    forward: bool,
 ) -> bool:
-    dir_flag = resolve_forward_dir(cfg.invert_dir)
+    dir_flag = resolve_direction_flag(forward=forward)
     frame = build_pos_control_frame(
         addr=cfg.addr,
         dir_flag=dir_flag,
@@ -392,15 +375,17 @@ def _send_forward_once(
         relative_mode=True,
         sync_start=False,
     )
-    return _send_frame(serial_link=serial_link, frame=frame, dry_run=cfg.dry_run, event="FORWARD_TX")
+    event = "FORWARD_TX" if forward else "BACKWARD_TX"
+    return _send_frame(serial_link=serial_link, frame=frame, dry_run=cfg.dry_run, event=event)
 
 
 def _print_help() -> None:
     print(
         "\nCommands:\n"
         "  f            forward one step\n"
+        "  b            backward one step\n"
         "  h            show help\n"
-        "  Ctrl+C       exit and auto-disable\n"
+        "  Ctrl+C       exit\n"
     )
 
 
@@ -416,8 +401,8 @@ def run_feed(cfg: FeedConfig) -> int:
             write_timeout=0.2,
         )
 
-    # 软件侧“相对位移计数”起点：将 0 裁剪进 [min,max]
-    current_pulses = max(cfg.min_pulses, min(0, cfg.max_pulses))
+    # 软件侧“相对位移累计计数”（仅日志显示，不做限位拦截）。
+    current_pulses = 0
     step_pulses = int(cfg.step_pulses)
 
     log_event(
@@ -426,8 +411,6 @@ def run_feed(cfg: FeedConfig) -> int:
         port=cfg.port,
         addr=cfg.addr,
         step=step_pulses,
-        min=cfg.min_pulses,
-        max=cfg.max_pulses,
         current=current_pulses,
     )
 
@@ -449,28 +432,31 @@ def run_feed(cfg: FeedConfig) -> int:
                 continue
 
             if cmd == "f":
-                ok, next_pulses = compute_next_forward_target(
-                    current_pulses=current_pulses,
+                if not _send_step_once(
+                    serial_link,
+                    cfg,
                     step_pulses=step_pulses,
-                    min_pulses=cfg.min_pulses,
-                    max_pulses=cfg.max_pulses,
-                )
-                if not ok:
-                    log_event(
-                        "LIMIT_HIT",
-                        current=current_pulses,
-                        step=step_pulses,
-                        min=cfg.min_pulses,
-                        max=cfg.max_pulses,
-                    )
-                    continue
-
-                if not _send_forward_once(serial_link, cfg, step_pulses=step_pulses):
+                    forward=True,
+                ):
                     log_event("ABORT", reason="FORWARD_TX_FAIL")
                     return 3
 
-                current_pulses = next_pulses
+                current_pulses += step_pulses
                 log_event("FORWARD_OK", current=current_pulses, step=step_pulses)
+                continue
+
+            if cmd == "b":
+                if not _send_step_once(
+                    serial_link,
+                    cfg,
+                    step_pulses=step_pulses,
+                    forward=False,
+                ):
+                    log_event("ABORT", reason="BACKWARD_TX_FAIL")
+                    return 3
+
+                current_pulses -= step_pulses
+                log_event("BACKWARD_OK", current=current_pulses, step=step_pulses)
                 continue
 
             log_event("BAD_CMD", reason="UNKNOWN", value=cmd)
@@ -482,8 +468,6 @@ def run_feed(cfg: FeedConfig) -> int:
         log_event("STOP", reason="KEYBOARD_INTERRUPT")
         return 130
     finally:
-        if cfg.disable_on_exit:
-            _send_enable(serial_link, cfg, state=False)
         if serial_link is not None:
             try:
                 serial_link.close()

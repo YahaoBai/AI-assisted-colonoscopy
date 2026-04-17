@@ -42,15 +42,20 @@ python -m control.teleop
 
 可选参数：
 - `--dry-run`：仅验证手柄映射与安全状态机，不下发串口。
-- `--debug-input`：低频打印手柄输入快照（轴值/按钮/角速度）。
+- `--debug-input`：低频打印手柄输入快照（按钮状态 + 目标计数）。
 - `--list-controllers`：扫描并列出当前识别到的手柄后退出。
 
 ### 按键约定（默认）
 
 - 左摇杆：偏航/俯仰
-- `Y`：前进一步进（仅当 `sim2real.feed.teleop_enabled=true` 时生效）
-- `A`:长按 1s：软件急停（ESTOP latch）
-- `X`:（左侧按键）长按 1s：复位序列（fault_clear -> work_start -> follow_zero + feed disable->enable）
+- `Y`：滑台前进（按住连续）
+- `A`：滑台后退（按住连续）
+
+说明：
+- 手动急停/手动复位按键入口已移除。
+- 自动急停仍保留（通信异常/监控异常/发送失败/控制越界）。
+- 启动阶段仍会执行一次自动复位序列。
+- 自动急停后通过“重启程序”恢复，不再使用手动复位键。
 
 ## 6. 进给独立硬件脚本 (Feed Axis Bring-up)
 
@@ -73,5 +78,6 @@ python -m control.feed
 ### 交互命令
 
 - `f`：前进一次（相对模式，+step_pulses）
+- `b`：后退一次（相对模式，-step_pulses）
 - `h`：显示帮助
-- `Ctrl+C`：退出程序并自动发送失能命令
+- `Ctrl+C`：退出程序（不主动发送失能）

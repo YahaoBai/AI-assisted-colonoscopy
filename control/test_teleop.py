@@ -11,7 +11,6 @@ import control.teleop_runtime as tr
 from control.feed import FeedConfig
 from control.sim2real_bridge import BridgeCommand, FaultClearVerification
 from control.teleop import (
-    HoldLatch,
     PygameGamepadInput,
     TeleopConfig,
     build_arg_parser,
@@ -167,9 +166,7 @@ class FakeRuntimeGamepad:
                 axis_x=0.7,
                 axis_y=-0.7,
                 forward_pressed=False,
-                estop_pressed=False,
-                reset_primary_pressed=False,
-                reset_secondary_pressed=False,
+                backward_pressed=False,
                 connected=True,
             )
         raise KeyboardInterrupt()
@@ -196,11 +193,7 @@ class TeleopCoreTests(unittest.TestCase):
             repeat_hz=repeat_hz,
             default_vel=100,
             default_acc=0,
-            invert_dir=False,
-            min_pulses=0,
-            max_pulses=1000,
             enable_on_start=True,
-            disable_on_exit=True,
             teleop_enabled=teleop_enabled,
             dry_run=dry_run,
         )
@@ -290,16 +283,6 @@ class TeleopCoreTests(unittest.TestCase):
         self.assertAlmostEqual(PygameGamepadInput._normalize_axis_value(-16384), -0.5, places=3)
         self.assertAlmostEqual(PygameGamepadInput._normalize_axis_value(32767), 1.0, places=4)
         self.assertAlmostEqual(PygameGamepadInput._normalize_axis_value(-32768), -1.0, places=7)
-
-    def test_hold_latch_only_fires_once_per_press(self) -> None:
-        latch = HoldLatch()
-        self.assertFalse(latch.update(active=True, now_sec=0.0, hold_sec=1.0))
-        self.assertFalse(latch.update(active=True, now_sec=0.8, hold_sec=1.0))
-        self.assertTrue(latch.update(active=True, now_sec=1.1, hold_sec=1.0))
-        self.assertFalse(latch.update(active=True, now_sec=1.6, hold_sec=1.0))
-        self.assertFalse(latch.update(active=False, now_sec=1.7, hold_sec=1.0))
-        self.assertFalse(latch.update(active=True, now_sec=2.0, hold_sec=1.0))
-        self.assertTrue(latch.update(active=True, now_sec=3.1, hold_sec=1.0))
 
     def test_disconnect_timeout_estop(self) -> None:
         self.assertTrue(
@@ -409,34 +392,35 @@ class TeleopCoreTests(unittest.TestCase):
         loop_state = tr._create_loop_state(control_hz=30.0)
 
         with patch(
-            "control.teleop_runtime._handle_feed_forward_rising_edge",
+            "control.teleop_runtime._handle_feed_step_once",
             return_value="sent",
         ) as mock_feed_step:
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=True),
+                sample=SimpleNamespace(forward_pressed=True, backward_pressed=False),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.00,
             )
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=True),
+                sample=SimpleNamespace(forward_pressed=True, backward_pressed=False),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.10,
             )
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=True),
+                sample=SimpleNamespace(forward_pressed=True, backward_pressed=False),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.21,
             )
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=True),
+                sample=SimpleNamespace(forward_pressed=True, backward_pressed=False),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.42,
             )
         self.assertEqual(mock_feed_step.call_count, 3)
+        self.assertEqual(mock_feed_step.call_args_list[0].kwargs["forward"], True)
 
     def test_forward_release_stops_repeat(self) -> None:
         feed_state = self._make_feed_state(
@@ -449,89 +433,103 @@ class TeleopCoreTests(unittest.TestCase):
         loop_state = tr._create_loop_state(control_hz=30.0)
 
         with patch(
-            "control.teleop_runtime._handle_feed_forward_rising_edge",
+            "control.teleop_runtime._handle_feed_step_once",
             return_value="sent",
         ) as mock_feed_step:
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=True),
+                sample=SimpleNamespace(forward_pressed=True, backward_pressed=False),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.00,
             )
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=False),
+                sample=SimpleNamespace(forward_pressed=False, backward_pressed=False),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.05,
             )
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=False),
+                sample=SimpleNamespace(forward_pressed=False, backward_pressed=False),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.50,
             )
         self.assertEqual(mock_feed_step.call_count, 1)
 
-    def test_forward_limit_latched_until_release(self) -> None:
+    def test_backward_hold_repeats_by_repeat_hz(self) -> None:
         feed_state = self._make_feed_state(
             teleop_enabled=True,
             dry_run=True,
             locked=False,
-            repeat_hz=10.0,
+            repeat_hz=5.0,
         )
         ctx = self._make_ctx(feed_state)
         loop_state = tr._create_loop_state(control_hz=30.0)
 
         with patch(
-            "control.teleop_runtime._handle_feed_forward_rising_edge",
-            side_effect=["limit", "sent"],
+            "control.teleop_runtime._handle_feed_step_once",
+            return_value="sent",
         ) as mock_feed_step:
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=True),
+                sample=SimpleNamespace(forward_pressed=False, backward_pressed=True),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.00,
             )
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=True),
+                sample=SimpleNamespace(forward_pressed=False, backward_pressed=True),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.20,
             )
             tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=False),
+                sample=SimpleNamespace(forward_pressed=False, backward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.41,
+            )
+        self.assertEqual(mock_feed_step.call_count, 3)
+        self.assertEqual(mock_feed_step.call_args_list[0].kwargs["forward"], False)
+
+    def test_conflict_press_y_and_b_sends_nothing(self) -> None:
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
+        ctx = self._make_ctx(feed_state)
+        loop_state = tr._create_loop_state(control_hz=30.0)
+        with patch("control.teleop_runtime._handle_feed_step_once") as mock_step:
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True, backward_pressed=True),
+                loop_state=loop_state,
+                ctx=ctx,
+                loop_start=0.00,
+            )
+            tr._update_forward_state_and_feed(
+                sample=SimpleNamespace(forward_pressed=True, backward_pressed=True),
                 loop_state=loop_state,
                 ctx=ctx,
                 loop_start=0.30,
             )
-            tr._update_forward_state_and_feed(
-                sample=SimpleNamespace(forward_pressed=True),
-                loop_state=loop_state,
-                ctx=ctx,
-                loop_start=0.40,
-            )
-        self.assertEqual(mock_feed_step.call_count, 2)
+        mock_step.assert_not_called()
 
     def test_feed_forward_blocked_when_locked(self) -> None:
         feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=True)
         ctx = self._make_ctx(feed_state)
-        with patch("control.teleop_runtime._feed_send_forward_once") as mock_send:
-            tr._handle_feed_forward_rising_edge(ctx)
+        with patch("control.teleop_runtime._feed_send_step_once") as mock_send:
+            tr._handle_feed_step_once(ctx, forward=True)
         mock_send.assert_not_called()
 
     def test_feed_forward_ignored_when_teleop_disabled(self) -> None:
         feed_state = self._make_feed_state(teleop_enabled=False, dry_run=True, locked=False)
         ctx = self._make_ctx(feed_state)
-        with patch("control.teleop_runtime._feed_send_forward_once") as mock_send:
-            tr._handle_feed_forward_rising_edge(ctx)
+        with patch("control.teleop_runtime._feed_send_step_once") as mock_send:
+            tr._handle_feed_step_once(ctx, forward=True)
         mock_send.assert_not_called()
 
     def test_feed_forward_blocked_when_estop_latched(self) -> None:
         feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
         ctx = self._make_ctx(feed_state)
         ctx.sim2real_bridge.estop_latched = True
-        with patch("control.teleop_runtime._feed_send_forward_once") as mock_send:
-            tr._handle_feed_forward_rising_edge(ctx)
+        with patch("control.teleop_runtime._feed_send_step_once") as mock_send:
+            tr._handle_feed_step_once(ctx, forward=True)
         mock_send.assert_not_called()
 
     def test_feed_forward_reenable_pending_enable_then_send(self) -> None:
@@ -539,13 +537,13 @@ class TeleopCoreTests(unittest.TestCase):
         feed_state.reenable_pending = True
         ctx = self._make_ctx(feed_state)
         with patch("control.teleop_runtime._feed_send_enable", return_value=True) as mock_enable, patch(
-            "control.teleop_runtime._feed_send_forward_once",
+            "control.teleop_runtime._feed_send_step_once",
             return_value=True,
         ) as mock_send, patch("control.teleop_runtime.time.sleep", return_value=None):
-            result = tr._handle_feed_forward_rising_edge(ctx)
+            result = tr._handle_feed_step_once(ctx, forward=True)
         self.assertEqual(result, "sent")
         mock_enable.assert_called_once_with(feed_state, state=True)
-        mock_send.assert_called_once()
+        mock_send.assert_called_once_with(feed_state=feed_state, step_pulses=200, forward=True)
         self.assertFalse(feed_state.reenable_pending)
 
     def test_estop_latch_disables_and_locks_feed(self) -> None:
@@ -774,6 +772,68 @@ class TeleopCoreTests(unittest.TestCase):
         self.assertEqual(mock_setup_feed.call_count, 1)
         self.assertTrue(mock_setup_feed.call_args.kwargs["check_port_conflict"])
 
+    def test_cleanup_runtime_no_estop_and_no_feed_disable(self) -> None:
+        class _DummyGamepad:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class _DummyMonitor:
+            def __init__(self):
+                self.active_calls = []
+                self.stopped = False
+
+            def set_active(self, active):
+                self.active_calls.append(bool(active))
+
+            def stop(self, join_timeout_sec=1.0):
+                _ = join_timeout_sec
+                self.stopped = True
+
+        class _DummyTx:
+            def __init__(self):
+                self.estop_calls = 0
+
+            def send_estop_all(self, actuator_ids, critical=True):
+                _ = actuator_ids
+                _ = critical
+                self.estop_calls += 1
+                return True
+
+        class _DummySerial:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        gamepad = _DummyGamepad()
+        monitor = _DummyMonitor()
+        tx = _DummyTx()
+        actuator_serial = _DummySerial()
+        feed_serial = _DummySerial()
+        feed_state = self._make_feed_state(teleop_enabled=True, dry_run=False, locked=False)
+        feed_state.serial_link = feed_serial
+
+        with patch("control.teleop_runtime._feed_send_enable") as mock_feed_disable:
+            tr._cleanup_runtime(
+                gamepad=gamepad,
+                actuator_tx=tx,
+                actuator_monitor=monitor,
+                actuator_ids=(1, 2, 3, 4),
+                serial_link=actuator_serial,
+                feed_state=feed_state,
+            )
+
+        self.assertEqual(tx.estop_calls, 0)
+        mock_feed_disable.assert_not_called()
+        self.assertTrue(monitor.stopped)
+        self.assertTrue(actuator_serial.closed)
+        self.assertTrue(feed_serial.closed)
+        self.assertTrue(gamepad.closed)
+
 
 class TeleopConfigCompatTests(unittest.TestCase):
     def _write_yaml(self, yaml_text: str) -> str:
@@ -792,7 +852,6 @@ class TeleopConfigCompatTests(unittest.TestCase):
                 controller_index: 2
                 invert_yaw: true
                 invert_pitch: false
-                hold_sec: 0.7
                 disconnect_timeout_sec: 0.6
             """
         )
@@ -800,12 +859,7 @@ class TeleopConfigCompatTests(unittest.TestCase):
         self.assertEqual(cfg.controller_index, 2)
         self.assertTrue(cfg.invert_yaw)
         self.assertFalse(cfg.invert_pitch)
-        self.assertAlmostEqual(cfg.hold_sec, 0.7)
-        self.assertAlmostEqual(cfg.estop_hold_sec, 0.7)
-        self.assertAlmostEqual(cfg.reset_hold_sec, 0.7)
         self.assertAlmostEqual(cfg.disconnect_timeout_sec, 0.6)
-        self.assertEqual(cfg.estop_button, "south")
-        self.assertEqual(cfg.reset_combo, ("west", "west"))
         self.assertFalse(cfg.allow_feed_without_actuator)
         self.assertEqual(cfg.deprecation_warnings, ())
 
@@ -834,22 +888,26 @@ class TeleopConfigCompatTests(unittest.TestCase):
         cfg = load_teleop_config(path)
         self.assertTrue(cfg.allow_feed_without_actuator)
 
-    def test_load_teleop_config_legacy_hold_overrides_new_hold(self) -> None:
+    def test_load_teleop_config_removed_manual_estop_reset_fields_raise(self) -> None:
         path = self._write_yaml(
             """
             sim2real:
               teleop:
                 hold_sec: 0.9
+                estop_button: "start"
+                reset_combo: ["start", "back"]
                 estop_hold_sec: 1.2
                 reset_hold_sec: 1.3
             """
         )
-        cfg = load_teleop_config(path)
-        self.assertAlmostEqual(cfg.hold_sec, 0.9)
-        self.assertAlmostEqual(cfg.estop_hold_sec, 1.2)
-        self.assertAlmostEqual(cfg.reset_hold_sec, 1.3)
-        self.assertTrue(any("estop_hold_sec" in msg for msg in cfg.deprecation_warnings))
-        self.assertTrue(any("reset_hold_sec" in msg for msg in cfg.deprecation_warnings))
+        with self.assertRaises(ValueError) as ctx:
+            load_teleop_config(path)
+        text = str(ctx.exception)
+        self.assertIn("hold_sec", text)
+        self.assertIn("estop_button", text)
+        self.assertIn("reset_combo", text)
+        self.assertIn("estop_hold_sec", text)
+        self.assertIn("reset_hold_sec", text)
 
     def test_load_teleop_config_legacy_input_fields_still_work(self) -> None:
         path = self._write_yaml(
@@ -860,8 +918,6 @@ class TeleopConfigCompatTests(unittest.TestCase):
                 left_stick_x_axis: 3
                 left_stick_y_axis: 4
                 forward_button: "south"
-                estop_button: "start"
-                reset_combo: ["start", "back"]
             """
         )
         cfg = load_teleop_config(path)
@@ -869,9 +925,7 @@ class TeleopConfigCompatTests(unittest.TestCase):
         self.assertEqual(cfg.left_stick_x_axis, 3)
         self.assertEqual(cfg.left_stick_y_axis, 4)
         self.assertEqual(cfg.forward_button, "south")
-        self.assertEqual(cfg.estop_button, "start")
-        self.assertEqual(cfg.reset_combo, ("start", "back"))
-        self.assertGreaterEqual(len(cfg.deprecation_warnings), 6)
+        self.assertGreaterEqual(len(cfg.deprecation_warnings), 4)
 
     def test_parser_public_surface_hides_legacy_args(self) -> None:
         parser = build_arg_parser()

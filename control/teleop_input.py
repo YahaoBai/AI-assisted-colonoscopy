@@ -18,9 +18,7 @@ class GamepadSample:
     axis_x: float
     axis_y: float
     forward_pressed: bool
-    estop_pressed: bool
-    reset_primary_pressed: bool
-    reset_secondary_pressed: bool
+    backward_pressed: bool
     connected: bool
 
 
@@ -63,10 +61,14 @@ class PygameGamepadInput:
         self.pygame = None
         self.controller_mod = None
         self.controller = None
+        self.joystick = None
         self.controller_index: Optional[int] = None
         self.controller_name: str = ""
 
         self._button_ids: Dict[str, int] = {}
+        # 轴值就绪门：避免个别手柄在启动初期返回异常满量程。
+        self._axes_armed: bool = False
+        self._axis_center_threshold: float = 0.25
 
     def _import_backend(self) -> None:
         if self.pygame is not None and self.controller_mod is not None:
@@ -149,14 +151,20 @@ class PygameGamepadInput:
             selected_index, selected_name = candidates[0]
 
         self.controller = self.controller_mod.Controller(selected_index)
+        try:
+            self.joystick = self.pygame.joystick.Joystick(selected_index)
+            self.joystick.init()
+        except Exception:
+            # 轴值优先走 joystick；若初始化失败则回退到 controller.get_axis。
+            self.joystick = None
         self.controller_index = int(selected_index)
         self.controller_name = str(selected_name)
+        self._axes_armed = False
 
         self._button_ids = {
-            "forward": self._resolve_button_id(self.cfg.forward_button),
-            "estop": self._resolve_button_id(self.cfg.estop_button),
-            "reset_primary": self._resolve_button_id(self.cfg.reset_combo[0]),
-            "reset_secondary": self._resolve_button_id(self.cfg.reset_combo[1]),
+            # 固定语义：Y=前进，A=后退（不再由 YAML 覆盖）。
+            "forward": self._resolve_button_id("north"),
+            "backward": self._resolve_button_id("south"),
         }
 
     def _resolve_button_id(self, button_name: str) -> int:
@@ -189,24 +197,30 @@ class PygameGamepadInput:
                     axis_x=0.0,
                     axis_y=0.0,
                     forward_pressed=False,
-                    estop_pressed=False,
-                    reset_primary_pressed=False,
-                    reset_secondary_pressed=False,
+                    backward_pressed=False,
                     connected=False,
                 )
 
-            raw_axis_x = self.controller.get_axis(self.cfg.left_stick_x_axis)
-            raw_axis_y = self.controller.get_axis(self.cfg.left_stick_y_axis)
+            if self.joystick is not None:
+                raw_axis_x = self.joystick.get_axis(self.cfg.left_stick_x_axis)
+                raw_axis_y = self.joystick.get_axis(self.cfg.left_stick_y_axis)
+            else:
+                raw_axis_x = self.controller.get_axis(self.cfg.left_stick_x_axis)
+                raw_axis_y = self.controller.get_axis(self.cfg.left_stick_y_axis)
             axis_x = self._normalize_axis_value(raw_axis_x)
             axis_y = self._normalize_axis_value(raw_axis_y)
+            if not self._axes_armed:
+                if (
+                    abs(float(axis_x)) <= self._axis_center_threshold
+                    and abs(float(axis_y)) <= self._axis_center_threshold
+                ):
+                    self._axes_armed = True
+                else:
+                    # 未经过“中心位确认”前，禁止输出轴值，防止误动作。
+                    axis_x = 0.0
+                    axis_y = 0.0
             forward_pressed = bool(self.controller.get_button(self._button_ids["forward"]))
-            estop_pressed = bool(self.controller.get_button(self._button_ids["estop"]))
-            reset_primary_pressed = bool(
-                self.controller.get_button(self._button_ids["reset_primary"])
-            )
-            reset_secondary_pressed = bool(
-                self.controller.get_button(self._button_ids["reset_secondary"])
-            )
+            backward_pressed = bool(self.controller.get_button(self._button_ids["backward"]))
         except Exception:
             # 读取异常按断连处理，由上层触发安全动作
             return GamepadSample(
@@ -214,9 +228,7 @@ class PygameGamepadInput:
                 axis_x=0.0,
                 axis_y=0.0,
                 forward_pressed=False,
-                estop_pressed=False,
-                reset_primary_pressed=False,
-                reset_secondary_pressed=False,
+                backward_pressed=False,
                 connected=False,
             )
 
@@ -225,9 +237,7 @@ class PygameGamepadInput:
             axis_x=axis_x,
             axis_y=axis_y,
             forward_pressed=forward_pressed,
-            estop_pressed=estop_pressed,
-            reset_primary_pressed=reset_primary_pressed,
-            reset_secondary_pressed=reset_secondary_pressed,
+            backward_pressed=backward_pressed,
             connected=True,
         )
 
@@ -272,6 +282,12 @@ class PygameGamepadInput:
         return True
 
     def close(self) -> None:
+        if self.joystick is not None:
+            try:
+                self.joystick.quit()
+            except Exception:
+                pass
+            self.joystick = None
         if self.controller is not None:
             self._safe_close_controller(self.controller)
             self.controller = None

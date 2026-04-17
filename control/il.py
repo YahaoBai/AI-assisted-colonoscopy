@@ -67,7 +67,6 @@ key_states = {
     'forward': False, 'pitch_up': False, 'pitch_down': False,
     'yaw_left': False, 'yaw_right': False, 'zoom_in': False, 'zoom_out': False,
     'autopilot_toggle_pressed': False, 'autopilot_on': False,
-    'reset_estop_pressed': False,
 }
 
 def on_press(key):
@@ -76,9 +75,6 @@ def on_press(key):
             if key.char == '1': key_states['forward'] = True
             elif key.char == '+': key_states['zoom_in'] = True
             elif key.char == '-': key_states['zoom_out'] = True
-            elif key.char in ('r', 'R'):
-                if not key_states['reset_estop_pressed']:
-                    key_states['reset_estop_pressed'] = True
             elif key.char == '5':
                 if not key_states['autopilot_toggle_pressed']:
                     key_states['autopilot_toggle_pressed'] = True
@@ -98,7 +94,6 @@ def on_release(key):
             if key.char == '1': key_states['forward'] = False
             elif key.char == '+': key_states['zoom_in'] = False
             elif key.char == '-': key_states['zoom_out'] = False
-            elif key.char in ('r', 'R'): key_states['reset_estop_pressed'] = False
             elif key.char == '5': key_states['autopilot_toggle_pressed'] = False
         except AttributeError: pass
     else:
@@ -328,33 +323,9 @@ def run_reset_sequence(trigger: str) -> bool:
 
     print(
         f"❌ [Sim2Real] {trigger}：故障清除/RESET/回零未完成，已保持锁存。"
-        f"{detail_suffix} 请检查硬件状态后按 [R] 重试。"
+        f"{detail_suffix} 请检查硬件状态后重启程序重试。"
     )
     return False
-
-
-shutdown_estop_done = False
-
-
-def request_shutdown_estop(trigger: str) -> None:
-    global shutdown_estop_done
-
-    if shutdown_estop_done:
-        return
-
-    if serial_link is None or not getattr(serial_link, "is_open", False):
-        print(f">>> [Sim2Real] {trigger}：串口未就绪，无法再次下发全轴急停。")
-        return
-
-    try:
-        estop_ok = send_estop_all_critical()
-        if estop_ok:
-            shutdown_estop_done = True
-            print(f">>> [Sim2Real] {trigger}：全轴急停已下发。")
-        else:
-            print(f"❌ [Sim2Real] {trigger}：全轴急停下发失败，请立即人工确认硬件急停。")
-    except Exception as e:
-        print(f"❌ [Sim2Real] {trigger}：全轴急停异常: {e}")
 
 
 def emit_estop_alarm(frame_idx: int, reason: str, yaw_rad: float, pitch_rad: float) -> None:
@@ -365,7 +336,7 @@ def emit_estop_alarm(frame_idx: int, reason: str, yaw_rad: float, pitch_rad: flo
     bell = "\a" if estop_alarm_cfg.terminal_bell else ""
     alert_msg = (
         f"[ALARM][FRAME {frame_idx}] SIM2REAL ESTOP LATCHED | reason={reason} | "
-        f"yaw={np.rad2deg(yaw_rad):.2f}deg | pitch={np.rad2deg(pitch_rad):.2f}deg | PRESS [R] TO RESET"
+        f"yaw={np.rad2deg(yaw_rad):.2f}deg | pitch={np.rad2deg(pitch_rad):.2f}deg | RESTART TO RECOVER"
     )
 
     for _ in range(estop_alarm_cfg.repeat):
@@ -508,13 +479,13 @@ def process_mask_for_policy(raw_mask):
 
 print("\n" + "="*60)
 print("     结肠镜仿真系统 ")
-print("  [5] 自动模式开关 | [R] 清除角度锁存急停")
+print("  [5] 自动模式开关")
 print("="*60 + "\n")
 
 if run_reset_sequence("启动自动复位"):
     print(">>> [Sim2Real] 启动自动复位完成，可直接开始控制。")
 else:
-    print(">>> [Sim2Real] 启动自动复位失败，系统保持锁存；按 [R] 可重试。")
+    print(">>> [Sim2Real] 启动自动复位失败，系统保持锁存；请重启程序重试。")
 
 try:
     with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -532,17 +503,9 @@ try:
             step_start = time.time()
             dt = model.opt.timestep
 
-            if key_states['reset_estop_pressed']:
-                key_states['reset_estop_pressed'] = False
-
-                if not sim2real_bridge.estop_latched:
-                    print(">>> [Sim2Real] 当前未处于急停锁存，已忽略 [R]，避免误触发工作启动/回零。")
-                else:
-                    run_reset_sequence("手动复位")
-
             if sim2real_bridge.estop_latched and key_states['autopilot_on']:
                 key_states['autopilot_on'] = False
-                print(">>> [Sim2Real] 角度急停已锁存，自动模式被禁止。请按 [R] 复位。")
+                print(">>> [Sim2Real] 角度急停已锁存，自动模式被禁止。请重启程序恢复。")
 
             monitor_active = key_states['autopilot_on'] and (not sim2real_bridge.estop_latched)
             actuator_monitor.set_active(monitor_active)
@@ -576,7 +539,7 @@ try:
                 print(
                     f"[{frame_count}] 🛑 [Sim2Real] 监测线程触发急停锁存 | "
                     f"reason={monitor_fault.reason} id={monitor_fault.actuator_id} "
-                    f"fails={monitor_fault.consecutive_failures} err_bits=0x{monitor_fault.error_bits:02X} | 按 [R] 复位"
+                    f"fails={monitor_fault.consecutive_failures} err_bits=0x{monitor_fault.error_bits:02X} | 请重启程序恢复"
                 )
 
             # 1. 渲染物理世界
@@ -655,7 +618,7 @@ try:
                         print(
                             f"[{frame_count}] 🛑 [Sim2Real] 角度越界触发急停锁存 | "
                             f"yaw={np.rad2deg(bridge_result.yaw_accum_rad):.2f}° "
-                            f"pitch={np.rad2deg(bridge_result.pitch_accum_rad):.2f}° | 按 [R] 复位"
+                            f"pitch={np.rad2deg(bridge_result.pitch_accum_rad):.2f}° | 请重启程序恢复"
                         )
                     else:
                         send_ok = True
@@ -762,15 +725,13 @@ try:
             time.sleep(max(0, dt - (time.time() - step_start)))
 
 except KeyboardInterrupt:
-    print("\n>>> [Sim2Real] 检测到 Ctrl+C，正在下发全轴急停并退出...")
+    print("\n>>> [Sim2Real] 检测到 Ctrl+C，正在退出...")
     actuator_monitor.set_active(False)
     actuator_monitor.stop(join_timeout_sec=1.0)
-    request_shutdown_estop("Ctrl+C")
 
 finally:
     actuator_monitor.set_active(False)
     actuator_monitor.stop(join_timeout_sec=1.0)
-    request_shutdown_estop("程序退出")
     listener.stop()
     if serial_link is not None:
         serial_link.close()

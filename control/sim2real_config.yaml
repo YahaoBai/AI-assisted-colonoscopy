@@ -39,7 +39,7 @@ sim2real:
     # 关键控制帧（ESTOP/WORK_START/FOLLOW_ZERO）最少重发次数
     critical_retry_count: 3 
     # 关键控制帧重发间隔（秒）
-    critical_retry_interval_sec: 0.02
+    critical_retry_interval_sec: 0.1
 
   # =============================================================================
   # [Layer 3] 执行器（LA 电缸）语义映射与计数边界
@@ -122,6 +122,7 @@ sim2real:
   # =============================================================================
   # 手柄遥操作配置（control/teleop.py）
   # 摇杆轴值直接映射到四电缸目标位移（mm），不再使用角速度参数。
+  # 软件内手动急停/复位按钮映射已移除，仅保留断连/监测等自动安全路径。
   teleop:
     # 设备索引（固定由 YAML 管理）
     controller_index: 0
@@ -130,17 +131,18 @@ sim2real:
     invert_yaw: false
     invert_pitch: true
 
-    # 通用长按触发时长（秒）：
-    # 同时作用于 ESTOP 长按与 RESET 组合键长按。
-    # 若旧字段 estop_hold_sec/reset_hold_sec 存在，会分别覆盖并给出 deprecated 提示。
-    hold_sec: 1.0
-
     # 断连/超时后触发锁存急停
     disconnect_timeout_sec: 0.5
 
     # 仅滑台模式开关：true 时跳过电缸链路，仅保留手柄->滑台控制
     # 默认 false，确保原有“电缸+滑台”流程不受影响
     allow_feed_without_actuator: false
+
+
+
+    left_stick_x_axis: 0
+    left_stick_y_axis: 1
+
 
   # =============================================================================
   # [Layer 5.5] 进给滑台（Feed Slider, Emm_V5）
@@ -169,16 +171,10 @@ sim2real:
     # 位置控制速度/加速度参数
     default_vel: 100
     default_acc: 0
-    # 若机械安装方向相反，可翻转前进方向位
-    invert_dir: false
+    # 方向固定：Y=前进(dir=0), A=后退(dir=1)
 
-    # 软件限位（相对位移累计计数）
-    min_pulses: 0
-    max_pulses: 800000000
-
-    # 启动是否先使能；退出是否自动失能
+    # 启动是否先使能（退出不再主动失能）
     enable_on_start: true
-    disable_on_exit: true
 
   # =============================================================================
   # [Layer 6] 输出与可观测性（日志/CSV/曲线）

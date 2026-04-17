@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
@@ -86,36 +85,3 @@ def should_send_follow_command(
     if command != BridgeCommand.CMD:
         return False
     return bool(should_send_flag)
-
-
-@dataclass
-class HoldLatch:
-    """
-    按钮长按触发器（一次按压仅触发一次）。
-    """
-
-    pressed_since_sec: Optional[float] = None
-    fired: bool = False
-
-    def update(self, active: bool, now_sec: float, hold_sec: float) -> bool:
-        now_v = float(now_sec)
-        hold_v = max(0.0, float(hold_sec))
-
-        if not active:
-            self.pressed_since_sec = None
-            self.fired = False
-            return False
-
-        if self.pressed_since_sec is None:
-            self.pressed_since_sec = now_v
-            self.fired = False
-            return False
-
-        if self.fired:
-            return False
-
-        if now_v - self.pressed_since_sec >= hold_v:
-            self.fired = True
-            return True
-
-        return False

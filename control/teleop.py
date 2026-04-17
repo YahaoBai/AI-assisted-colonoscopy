@@ -3,14 +3,14 @@
 
 控制链路总览（展示版）:
 1) Gamepad Input (pygame controller)
-   -> 2) axis/button parsing + deadzone + hold detection
-   -> 3) yaw/pitch delta generation + feed forward edge trigger
+   -> 2) axis/button parsing
+   -> 3) yaw/pitch direct mm mapping + feed Y/B continuous trigger
    -> 4) Sim2RealBridge (angle/motor limit + estop latch)
-   -> 5) MotorMapper + ActuatorTx + FeedTx (F3 follow / ESTOP / RESET sequence)
+   -> 5) MotorMapper + ActuatorTx + FeedTx (F3 follow / auto-estop / boot reset)
 
 设计目标:
 - 与 il.py 自动驾驶入口解耦，专注手动上机联调。
-- 安全优先：长按急停、组合键复位、断连超时急停锁存。
+- 安全优先：保留自动急停（断连/监控/发送失败等）与启动自动复位。
 - 代码可讲解：模块分层清晰、关键逻辑有注释、结构化关键日志。
 """
 
@@ -20,7 +20,6 @@ import argparse
 from pathlib import Path
 
 from control.teleop_common import (
-    HoldLatch,
     apply_deadzone,
     axis_to_rate,
     log_event,
@@ -45,7 +44,6 @@ __all__ = [
     "TeleopConfig",
     "GamepadSample",
     "PygameGamepadInput",
-    "HoldLatch",
     "log_event",
     "apply_deadzone",
     "axis_to_rate",

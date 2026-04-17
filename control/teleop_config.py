@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Tuple
+from typing import Any, Mapping
 
 
 @dataclass
@@ -14,8 +14,8 @@ class TeleopConfig:
     - controller_index
     - invert_yaw
     - invert_pitch
-    - hold_sec
     - disconnect_timeout_sec
+    - allow_feed_without_actuator
 
     其余字段用于内部默认或兼容旧配置，不建议新配置直接使用。
     """
@@ -24,7 +24,6 @@ class TeleopConfig:
     controller_index: int = 0
     invert_yaw: bool = False
     invert_pitch: bool = True
-    hold_sec: float = 1.0
     disconnect_timeout_sec: float = 0.5
     # 显式开启“无电缸仅滑台”模式（默认关闭，避免影响原流程）
     allow_feed_without_actuator: bool = False
@@ -35,12 +34,7 @@ class TeleopConfig:
     left_stick_x_axis: int = 0
     left_stick_y_axis: int = 1
     forward_button: str = "north"
-    estop_button: str = "south"
-    # 复位默认使用单键 west（通过主/副键同名实现单键语义）
-    reset_combo: Tuple[str, str] = ("west", "west")
-    estop_hold_sec: float = 1.0
-    reset_hold_sec: float = 1.0
-    deprecation_warnings: Tuple[str, ...] = ()
+    deprecation_warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.backend = str(self.backend).strip().lower()
@@ -53,24 +47,13 @@ class TeleopConfig:
         self.left_stick_y_axis = int(self.left_stick_y_axis)
         self.invert_yaw = bool(self.invert_yaw)
         self.invert_pitch = bool(self.invert_pitch)
-        self.hold_sec = float(self.hold_sec)
         self.allow_feed_without_actuator = bool(self.allow_feed_without_actuator)
         self.forward_button = str(self.forward_button).strip().lower()
-        self.estop_button = str(self.estop_button).strip().lower()
-        self.reset_combo = tuple(str(x).strip().lower() for x in self.reset_combo)
-        self.estop_hold_sec = float(self.estop_hold_sec)
-        self.reset_hold_sec = float(self.reset_hold_sec)
         self.disconnect_timeout_sec = float(self.disconnect_timeout_sec)
         self.deprecation_warnings = tuple(str(x) for x in self.deprecation_warnings)
 
-        if self.hold_sec < 0.0:
-            raise ValueError("teleop.hold_sec must be >= 0.")
-        if self.estop_hold_sec < 0.0 or self.reset_hold_sec < 0.0:
-            raise ValueError("teleop.*_hold_sec must be >= 0.")
         if self.disconnect_timeout_sec <= 0.0:
             raise ValueError("teleop.disconnect_timeout_sec must be > 0.")
-        if len(self.reset_combo) != 2:
-            raise ValueError("teleop.reset_combo must contain exactly 2 button names.")
 
 
 def _load_raw_teleop_mapping(config_path: str | Path) -> Mapping[str, Any]:
@@ -116,25 +99,33 @@ def _warn_deprecated_config_field(
 
 def _build_effective_teleop_config(teleop_raw: Mapping[str, Any]) -> TeleopConfig:
     """
-    将公共 8 项与 legacy 字段合并为运行时配置（集中兼容映射入口）。
+    将公共参数与 legacy 字段合并为运行时配置（集中兼容映射入口）。
     """
     defaults = TeleopConfig()
     warnings: list[str] = []
 
-    removed_fields = ("deadzone", "max_yaw_rate_rad_s", "max_pitch_rate_rad_s")
+    removed_fields = (
+        "deadzone",
+        "max_yaw_rate_rad_s",
+        "max_pitch_rate_rad_s",
+        "hold_sec",
+        "estop_button",
+        "reset_combo",
+        "estop_hold_sec",
+        "reset_hold_sec",
+    )
     removed_hits = [name for name in removed_fields if name in teleop_raw]
     if removed_hits:
         text = ", ".join(removed_hits)
         raise ValueError(
             "Removed teleop fields are not supported: "
-            f"{text}. Teleop now uses direct mm mapping (no rate/deadzone params)."
+            f"{text}. Teleop now uses direct mm mapping and no in-app manual estop/reset fields."
         )
 
     # ---- Public ----
     controller_index = int(teleop_raw.get("controller_index", defaults.controller_index))
     invert_yaw = bool(teleop_raw.get("invert_yaw", defaults.invert_yaw))
     invert_pitch = bool(teleop_raw.get("invert_pitch", defaults.invert_pitch))
-    hold_sec = float(teleop_raw.get("hold_sec", defaults.hold_sec))
     disconnect_timeout_sec = float(
         teleop_raw.get("disconnect_timeout_sec", defaults.disconnect_timeout_sec)
     )
@@ -144,10 +135,6 @@ def _build_effective_teleop_config(teleop_raw: Mapping[str, Any]) -> TeleopConfi
             defaults.allow_feed_without_actuator,
         )
     )
-
-    # 新字段优先：hold_sec 作为 estop/reset 长按默认值
-    estop_hold_sec = hold_sec
-    reset_hold_sec = hold_sec
 
     # ---- Legacy compatibility ----
     backend = defaults.backend
@@ -181,33 +168,10 @@ def _build_effective_teleop_config(teleop_raw: Mapping[str, Any]) -> TeleopConfi
         forward_button = str(teleop_raw.get("forward_button", defaults.forward_button))
         _warn_deprecated_config_field(warnings, "forward_button", "fixed internal default")
 
-    estop_button = defaults.estop_button
-    if "estop_button" in teleop_raw:
-        estop_button = str(teleop_raw.get("estop_button", defaults.estop_button))
-        _warn_deprecated_config_field(warnings, "estop_button", "fixed internal default")
-
-    reset_combo = defaults.reset_combo
-    if "reset_combo" in teleop_raw:
-        combo_raw = teleop_raw.get("reset_combo", defaults.reset_combo)
-        if isinstance(combo_raw, str):
-            raise ValueError("`sim2real.teleop.reset_combo` must be a list of 2 button names.")
-        reset_combo = tuple(str(x) for x in combo_raw)
-        _warn_deprecated_config_field(warnings, "reset_combo", "fixed internal default")
-
-    # old hold keys override new hold_sec（兼容优先级要求）
-    if "estop_hold_sec" in teleop_raw:
-        estop_hold_sec = float(teleop_raw.get("estop_hold_sec", hold_sec))
-        _warn_deprecated_config_field(warnings, "estop_hold_sec", "hold_sec")
-
-    if "reset_hold_sec" in teleop_raw:
-        reset_hold_sec = float(teleop_raw.get("reset_hold_sec", hold_sec))
-        _warn_deprecated_config_field(warnings, "reset_hold_sec", "hold_sec")
-
     return TeleopConfig(
         controller_index=controller_index,
         invert_yaw=invert_yaw,
         invert_pitch=invert_pitch,
-        hold_sec=hold_sec,
         disconnect_timeout_sec=disconnect_timeout_sec,
         allow_feed_without_actuator=allow_feed_without_actuator,
         backend=backend,
@@ -215,10 +179,6 @@ def _build_effective_teleop_config(teleop_raw: Mapping[str, Any]) -> TeleopConfi
         left_stick_x_axis=left_stick_x_axis,
         left_stick_y_axis=left_stick_y_axis,
         forward_button=forward_button,
-        estop_button=estop_button,
-        reset_combo=reset_combo,
-        estop_hold_sec=estop_hold_sec,
-        reset_hold_sec=reset_hold_sec,
         deprecation_warnings=tuple(warnings),
     )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Tuple
@@ -24,12 +25,10 @@ from control.feed import (
     SerialLink,
     build_en_control_frame,
     build_pos_control_frame,
-    compute_next_forward_target,
     resolve_feed_config,
-    resolve_forward_dir,
+    resolve_direction_flag,
 )
 from control.teleop_common import (
-    HoldLatch,
     log_event as _base_log_event,
     should_trigger_disconnect_estop,
 )
@@ -41,6 +40,7 @@ FEED_RESET_DISABLE_SETTLE_SEC = 0.15
 FEED_RESET_ENABLE_SETTLE_SEC = 0.15
 FEED_POST_RESET_PREMOVE_SETTLE_SEC = 0.10
 _ESTOP_LOG_FREEZE = False
+_INPUT_LINE_ACTIVE = False
 
 
 def _set_estop_log_freeze(enabled: bool) -> None:
@@ -48,12 +48,34 @@ def _set_estop_log_freeze(enabled: bool) -> None:
     _ESTOP_LOG_FREEZE = bool(enabled)
 
 
+def _flush_input_line_if_needed() -> None:
+    """
+    若当前有 INPUT 状态栏，先换行再打印其他日志。
+    """
+    global _INPUT_LINE_ACTIVE
+    if _INPUT_LINE_ACTIVE:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        _INPUT_LINE_ACTIVE = False
+
+
 def log_event(event: str, force: bool = False, **fields: Any) -> None:
     """
     Teleop 日志封装：急停后默认静默，除非 force=True。
     """
+    global _INPUT_LINE_ACTIVE
     if _ESTOP_LOG_FREEZE and (not force):
         return
+    if event == "INPUT":
+        parts = [f"[{event}]"]
+        for key in sorted(fields.keys()):
+            parts.append(f"{key}={fields[key]}")
+        text = " ".join(parts)
+        sys.stdout.write("\r\033[2K" + text)
+        sys.stdout.flush()
+        _INPUT_LINE_ACTIVE = True
+        return
+    _flush_input_line_if_needed()
     _base_log_event(event, **fields)
 
 
@@ -67,6 +89,7 @@ def _print_estop_banner(reason: str, actuator_id: Optional[int], error_bits: Opt
     if error_bits is not None:
         parts.append(f"error_bits=0x{int(error_bits):02X}")
     text = " ".join(parts)
+    _flush_input_line_if_needed()
     print(f"!!! ESTOP_LATCHED {text} !!!")
 
 
@@ -82,8 +105,7 @@ class FeedRuntimeState:
     current_pulses: int
     locked: bool
     reenable_pending: bool = False
-    next_forward_send_ts: float = 0.0
-    forward_limit_latched: bool = False
+    next_send_ts: float = 0.0
 
 
 @dataclass
@@ -110,12 +132,12 @@ class TeleopLoopState:
     """
     主循环可变状态。
 
-    包括长按判定状态、前进占位边沿状态、循环节拍与调试打印节拍。
+    包括进给按键边沿状态、循环节拍与调试打印节拍。
     """
 
-    estop_hold: HoldLatch
-    reset_hold: HoldLatch
     forward_pressed_prev: bool
+    backward_pressed_prev: bool
+    feed_conflict_prev: bool
     period_sec: float
     loop_ts_prev: float
     last_input_ok_sec: float
@@ -245,15 +267,26 @@ def perform_reset_sequence(
     return True, "OK"
 
 
+def on_feed_state_change(direction: str, is_pressed: bool, ts_sec: float) -> None:
+    """
+    进给状态回调（静默）。
+
+    说明：
+    - 按键边沿日志（FORWARD_STATE_CHANGE/BACKWARD_STATE_CHANGE）已按需求关闭，
+      避免影响终端观察关键硬件日志。
+    - 保留该函数仅用于兼容现有调用路径。
+    """
+    _ = direction
+    _ = is_pressed
+    _ = ts_sec
+    return
+
+
 def on_forward_state_change(is_pressed: bool, ts_sec: float) -> None:
     """
-    前进状态回调（仅记录边沿状态，真实推进由上层触发）。
+    兼容旧调用：等价于 forward 方向状态回调。
     """
-    log_event(
-        "FORWARD_STATE_CHANGE",
-        pressed=int(bool(is_pressed)),
-        ts=f"{float(ts_sec):.3f}",
-    )
+    on_feed_state_change(direction="forward", is_pressed=is_pressed, ts_sec=ts_sec)
 
 
 def log_input_snapshot(
@@ -263,6 +296,7 @@ def log_input_snapshot(
     delta_yaw: float,
     delta_pitch: float,
     estop_latched: bool,
+    feed_current_pulses: Optional[int] = None,
     motor_counts: Optional[Tuple[int, int, int, int]] = None,
 ) -> None:
     """
@@ -276,12 +310,8 @@ def log_input_snapshot(
     _ = pitch_rate
     _ = delta_yaw
     _ = delta_pitch
-    reset_active = sample.reset_primary_pressed and sample.reset_secondary_pressed
     payload: dict[str, Any] = {
-        "connected": int(sample.connected),
-        "forward": int(sample.forward_pressed),
-        "estop": int(sample.estop_pressed),
-        "reset": int(reset_active),
+        "current": int(feed_current_pulses) if feed_current_pulses is not None else 0,
         "estop_latched": int(estop_latched),
     }
     if motor_counts is not None:
@@ -299,8 +329,7 @@ def _disabled_feed_state() -> FeedRuntimeState:
         serial_link=None,
         current_pulses=0,
         locked=False,
-        next_forward_send_ts=0.0,
-        forward_limit_latched=False,
+        next_send_ts=0.0,
     )
 
 
@@ -331,8 +360,10 @@ def _feed_send_frame(feed_state: FeedRuntimeState, frame: bytes, event: str) -> 
         return False
 
     cfg = feed_state.cfg
+    tx_event_muted = event in {"FEED_FORWARD_TX", "FEED_BACKWARD_TX"}
     if cfg.dry_run:
-        log_event(event, frame=frame.hex(" ").upper())
+        if not tx_event_muted:
+            log_event(event, frame=frame.hex(" ").upper())
         return True
 
     if feed_state.serial_link is None:
@@ -350,7 +381,8 @@ def _feed_send_frame(feed_state: FeedRuntimeState, frame: bytes, event: str) -> 
         log_event("FEED_TX_FAIL", reason=f"SHORT_WRITE wrote={wrote} expected={len(frame)}")
         return False
 
-    log_event(event, frame=frame.hex(" ").upper())
+    if not tx_event_muted:
+        log_event(event, frame=frame.hex(" ").upper())
     return True
 
 
@@ -369,20 +401,21 @@ def _feed_send_enable(feed_state: FeedRuntimeState, state: bool) -> bool:
     )
 
 
-def _feed_send_forward_once(feed_state: FeedRuntimeState, step_pulses: int) -> bool:
+def _feed_send_step_once(feed_state: FeedRuntimeState, step_pulses: int, forward: bool) -> bool:
     if not feed_state.enabled or feed_state.cfg is None:
         return True
     cfg = feed_state.cfg
     frame = build_pos_control_frame(
         addr=cfg.addr,
-        dir_flag=resolve_forward_dir(cfg.invert_dir),
+        dir_flag=resolve_direction_flag(forward=forward),
         vel=cfg.default_vel,
         acc=cfg.default_acc,
         clk=int(step_pulses),
         relative_mode=True,
         sync_start=False,
     )
-    return _feed_send_frame(feed_state=feed_state, frame=frame, event="FEED_FORWARD_TX")
+    event = "FEED_FORWARD_TX" if forward else "FEED_BACKWARD_TX"
+    return _feed_send_frame(feed_state=feed_state, frame=frame, event=event)
 
 
 def _setup_feed_runtime(
@@ -416,15 +449,14 @@ def _setup_feed_runtime(
             write_timeout=0.2,
         )
 
-    current_pulses = max(feed_cfg.min_pulses, min(0, feed_cfg.max_pulses))
+    current_pulses = 0
     feed_state = FeedRuntimeState(
         enabled=True,
         cfg=feed_cfg,
         serial_link=feed_serial_link,
         current_pulses=current_pulses,
         locked=False,
-        next_forward_send_ts=0.0,
-        forward_limit_latched=False,
+        next_send_ts=0.0,
     )
     log_event(
         "FEED_READY",
@@ -434,8 +466,6 @@ def _setup_feed_runtime(
         step=feed_cfg.step_pulses,
         repeat_hz=feed_cfg.repeat_hz,
         current=current_pulses,
-        min=feed_cfg.min_pulses,
-        max=feed_cfg.max_pulses,
     )
 
     if feed_cfg.enable_on_start and (not _feed_send_enable(feed_state, state=True)):
@@ -444,58 +474,40 @@ def _setup_feed_runtime(
     return feed_state
 
 
-def _handle_feed_forward_rising_edge(ctx: TeleopRuntimeContext) -> str:
+def _handle_feed_step_once(ctx: TeleopRuntimeContext, forward: bool) -> str:
     """
-    执行一次“前进一步进”尝试。
+    执行一次单步进给尝试。
 
     返回:
         "sent"   : 本次成功发送
-        "limit"  : 命中限位（本次按住期间锁存）
         "blocked": 锁存/禁用等状态不允许发送
-        "failed" : 发送失败并触发急停
+        "failed" : 发送失败（仅告警，不触发急停）
     """
     feed_state = ctx.feed_state
     if not feed_state.enabled or feed_state.cfg is None:
         return "blocked"
     if feed_state.locked or ctx.sim2real_bridge.estop_latched:
-        log_event("FEED_FORWARD_BLOCKED", reason="LOCKED")
-        return "blocked"
-    if feed_state.forward_limit_latched:
+        event = "FEED_FORWARD_BLOCKED" if forward else "FEED_BACKWARD_BLOCKED"
+        log_event(event, reason="LOCKED")
         return "blocked"
 
     if feed_state.reenable_pending:
         if not _feed_send_enable(feed_state, state=True):
-            _latch_estop(ctx, reason="FEED_REENABLE_FAIL")
             return "failed"
         time.sleep(FEED_POST_RESET_PREMOVE_SETTLE_SEC)
         feed_state.reenable_pending = False
         log_event("FEED_REENABLE_OK")
 
     cfg = feed_state.cfg
-    ok, next_pulses = compute_next_forward_target(
-        current_pulses=feed_state.current_pulses,
+    if not _feed_send_step_once(
+        feed_state=feed_state,
         step_pulses=cfg.step_pulses,
-        min_pulses=cfg.min_pulses,
-        max_pulses=cfg.max_pulses,
-    )
-    if not ok:
-        log_event(
-            "LIMIT_HIT",
-            subsystem="FEED",
-            current=feed_state.current_pulses,
-            step=cfg.step_pulses,
-            min=cfg.min_pulses,
-            max=cfg.max_pulses,
-        )
-        feed_state.forward_limit_latched = True
-        return "limit"
-
-    if not _feed_send_forward_once(feed_state=feed_state, step_pulses=cfg.step_pulses):
-        _latch_estop(ctx, reason="FEED_TX_FAIL")
+        forward=forward,
+    ):
         return "failed"
 
-    feed_state.current_pulses = int(next_pulses)
-    log_event("FEED_FORWARD_OK", current=feed_state.current_pulses, step=cfg.step_pulses)
+    delta = int(cfg.step_pulses) if forward else -int(cfg.step_pulses)
+    feed_state.current_pulses = int(feed_state.current_pulses) + delta
     return "sent"
 
 
@@ -513,8 +525,7 @@ def _feed_reset_disable_enable(feed_state: FeedRuntimeState) -> Tuple[bool, str]
     time.sleep(FEED_RESET_ENABLE_SETTLE_SEC)
     feed_state.locked = False
     feed_state.reenable_pending = True
-    feed_state.forward_limit_latched = False
-    feed_state.next_forward_send_ts = 0.0
+    feed_state.next_send_ts = 0.0
     return True, "OK"
 
 
@@ -610,8 +621,7 @@ def _run_boot_reset(ctx: TeleopRuntimeContext) -> None:
         allow_feed_without_actuator=ctx.allow_feed_without_actuator,
     )
     if not ok:
-        log_event("BOOT_RESET_FAIL", reason=reason)
-        _latch_estop(ctx, reason="BOOT_RESET_FAIL")
+        return
     else:
         log_event("BOOT_READY", mode="DRY_RUN" if ctx.dry_run else "HARDWARE")
 
@@ -622,9 +632,9 @@ def _create_loop_state(control_hz: float) -> TeleopLoopState:
     """
     now = time.monotonic()
     return TeleopLoopState(
-        estop_hold=HoldLatch(),
-        reset_hold=HoldLatch(),
         forward_pressed_prev=False,
+        backward_pressed_prev=False,
+        feed_conflict_prev=False,
         period_sec=1.0 / float(control_hz),
         loop_ts_prev=now,
         last_input_ok_sec=now,
@@ -664,39 +674,56 @@ def _update_forward_state_and_feed(
     loop_start: float,
 ) -> None:
     """
-    前进键处理：边沿日志 + 按住连续进给（定时发送）。
+    进给按键处理：Y 连续前进、B 连续后退、同时按下冲突保护。
     """
     feed_state = ctx.feed_state
-    prev_pressed = bool(loop_state.forward_pressed_prev)
-    now_pressed = bool(sample.forward_pressed)
+    prev_forward = bool(loop_state.forward_pressed_prev)
+    prev_backward = bool(loop_state.backward_pressed_prev)
+    now_forward = bool(sample.forward_pressed)
+    now_backward = bool(sample.backward_pressed)
     repeat_period = _feed_repeat_period_sec(feed_state)
 
-    if now_pressed != prev_pressed:
-        loop_state.forward_pressed_prev = now_pressed
-        on_forward_state_change(now_pressed, time.time())
-        if not now_pressed:
-            feed_state.forward_limit_latched = False
-            feed_state.next_forward_send_ts = loop_start
-            return
+    if now_forward != prev_forward:
+        loop_state.forward_pressed_prev = now_forward
+        on_feed_state_change(direction="forward", is_pressed=now_forward, ts_sec=time.time())
 
-        feed_state.forward_limit_latched = False
-        result = _handle_feed_forward_rising_edge(ctx)
-        feed_state.next_forward_send_ts = loop_start + repeat_period
-        if result == "limit":
-            feed_state.forward_limit_latched = True
-        return
+    if now_backward != prev_backward:
+        loop_state.backward_pressed_prev = now_backward
+        on_feed_state_change(direction="backward", is_pressed=now_backward, ts_sec=time.time())
 
-    if not now_pressed:
-        return
-    if feed_state.forward_limit_latched:
-        return
-    if loop_start < feed_state.next_forward_send_ts:
+    conflict_now = bool(now_forward and now_backward)
+    if conflict_now and (not loop_state.feed_conflict_prev):
+        log_event("FEED_DIRECTION_CONFLICT", forward=1, backward=1)
+    loop_state.feed_conflict_prev = conflict_now
+
+    if conflict_now:
+        feed_state.next_send_ts = loop_start + repeat_period
         return
 
-    result = _handle_feed_forward_rising_edge(ctx)
-    feed_state.next_forward_send_ts = loop_start + repeat_period
-    if result == "limit":
-        feed_state.forward_limit_latched = True
+    direction_now: Optional[str]
+    if now_forward:
+        direction_now = "forward"
+    elif now_backward:
+        direction_now = "backward"
+    else:
+        direction_now = None
+
+    direction_prev: Optional[str]
+    if prev_forward and (not prev_backward):
+        direction_prev = "forward"
+    elif prev_backward and (not prev_forward):
+        direction_prev = "backward"
+    else:
+        direction_prev = None
+
+    if direction_now is None:
+        feed_state.next_send_ts = loop_start
+        return
+
+    direction_changed = direction_now != direction_prev
+    if direction_changed or loop_start >= feed_state.next_send_ts:
+        _handle_feed_step_once(ctx, forward=(direction_now == "forward"))
+        feed_state.next_send_ts = loop_start + repeat_period
 
 
 def _handle_disconnect_estop(
@@ -719,59 +746,7 @@ def _handle_disconnect_estop(
         controller_connected=sample.connected,
     )
     if disconnected:
-        _latch_estop(ctx, reason="GAMEPAD_DISCONNECT_OR_TIMEOUT")
-
-
-def _handle_manual_estop_and_reset(
-    sample: GamepadSample,
-    loop_start: float,
-    teleop_cfg: Any,
-    loop_state: TeleopLoopState,
-    ctx: TeleopRuntimeContext,
-) -> None:
-    """
-    手动急停与复位组合键处理。
-    """
-    reset_combo_active = sample.reset_primary_pressed and sample.reset_secondary_pressed
-    estop_hold_active = sample.estop_pressed and (not reset_combo_active)
-
-    if loop_state.estop_hold.update(
-        active=estop_hold_active,
-        now_sec=loop_start,
-        hold_sec=teleop_cfg.estop_hold_sec,
-    ):
-        _latch_estop(ctx, reason="MANUAL_HOLD")
-
-    if not loop_state.reset_hold.update(
-        active=reset_combo_active,
-        now_sec=loop_start,
-        hold_sec=teleop_cfg.reset_hold_sec,
-    ):
         return
-
-    if not ctx.sim2real_bridge.estop_latched:
-        log_event("RESET_IGNORED", reason="NOT_LATCHED")
-        return
-
-    if ctx.actuator_monitor is not None:
-        ctx.actuator_monitor.set_active(False)
-    ok, reason = perform_reset_sequence(
-        actuator_tx=ctx.actuator_tx,
-        actuator_monitor=ctx.actuator_monitor,
-        motor_mapper=ctx.motor_mapper,
-        actuator_ids=ctx.actuator_ids,
-        sim2real_bridge=ctx.sim2real_bridge,
-        monitor_settle_sec=ctx.monitor_settle_sec,
-        dry_run=ctx.dry_run,
-        feed_state=ctx.feed_state,
-        allow_feed_without_actuator=ctx.allow_feed_without_actuator,
-    )
-    if ok:
-        _set_estop_log_freeze(False)
-        log_event("RESET_SUCCESS")
-    else:
-        ctx.sim2real_bridge.estop_latched = True
-        log_event("RESET_FAIL", reason=reason)
 
 
 def _handle_monitor_fault(ctx: TeleopRuntimeContext) -> None:
@@ -846,54 +821,36 @@ def _maybe_log_debug_snapshot(
     delta_yaw: float,
     delta_pitch: float,
     estop_latched: bool,
+    motor_target_mm: Optional[np.ndarray],
     loop_state: TeleopLoopState,
     ctx: TeleopRuntimeContext,
 ) -> None:
     """
-    输入变化触发的调试日志（含最小间隔限频）。
+    调试输入快照（固定频率，单行原地刷新）。
 
     设计目的:
-    - 仅在输入/状态变化时打印，减少静止时刷屏。
-    - 仍保留最小间隔限制，避免高频抖动产生过多日志。
+    - 保证状态栏稳定更新，避免“回中后旧值残留”的观感问题。
+    - 通过固定最小间隔（默认 5Hz）避免刷屏。
     """
     if not enabled:
+        return
+    if loop_start < loop_state.next_debug_ts:
         return
 
     motor_counts: Optional[Tuple[int, int, int, int]] = None
     try:
-        motor_counts_arr = ctx.motor_mapper.mm_targets_to_counts(ctx.sim2real_bridge.motor_target_mm)
+        target_for_log = (
+            np.asarray(motor_target_mm, dtype=np.float64)
+            if motor_target_mm is not None
+            else np.asarray(ctx.sim2real_bridge.motor_target_mm, dtype=np.float64)
+        )
+        motor_counts_arr = ctx.motor_mapper.mm_targets_to_counts(target_for_log)
         motor_counts_vec = np.asarray(motor_counts_arr, dtype=np.int32).reshape(-1)
         if motor_counts_vec.shape == (4,):
             motor_counts = tuple(int(v) for v in motor_counts_vec.tolist())
     except Exception:
         # 调试日志不应影响主控制流：映射失败时跳过计数字段。
         motor_counts = None
-
-    changed = False
-    axis_eps = 0.03
-    rate_eps = 0.03
-    prev_sample = loop_state.last_debug_sample
-    if not loop_state.has_debug_snapshot or prev_sample is None:
-        changed = True
-    else:
-        changed = any(
-            (
-                sample.connected != prev_sample.connected,
-                abs(sample.axis_x - prev_sample.axis_x) >= axis_eps,
-                abs(sample.axis_y - prev_sample.axis_y) >= axis_eps,
-                sample.forward_pressed != prev_sample.forward_pressed,
-                sample.estop_pressed != prev_sample.estop_pressed,
-                sample.reset_primary_pressed != prev_sample.reset_primary_pressed,
-                sample.reset_secondary_pressed != prev_sample.reset_secondary_pressed,
-                abs(yaw_rate - loop_state.last_debug_yaw_rate) >= rate_eps,
-                abs(pitch_rate - loop_state.last_debug_pitch_rate) >= rate_eps,
-                estop_latched != loop_state.last_debug_estop_latched,
-                motor_counts != loop_state.last_debug_motor_counts,
-            )
-        )
-
-    if not changed or loop_start < loop_state.next_debug_ts:
-        return
 
     log_input_snapshot(
         sample=sample,
@@ -902,6 +859,11 @@ def _maybe_log_debug_snapshot(
         delta_yaw=delta_yaw,
         delta_pitch=delta_pitch,
         estop_latched=estop_latched,
+        feed_current_pulses=(
+            int(ctx.feed_state.current_pulses)
+            if ctx.feed_state.enabled
+            else 0
+        ),
         motor_counts=motor_counts,
     )
     loop_state.next_debug_ts = loop_start + loop_state.debug_interval_sec
@@ -958,7 +920,7 @@ def _send_direct_target_and_check_limits(
         critical=False,
     )
     if not send_ok:
-        _latch_estop(ctx, reason="SERIAL_TX_FAIL")
+        return
 
 
 def _sleep_for_rate(loop_start: float, period_sec: float) -> None:
@@ -986,29 +948,17 @@ def _cleanup_runtime(
         actuator_monitor.set_active(False)
         actuator_monitor.stop(join_timeout_sec=1.0)
 
-    if actuator_tx is not None:
-        try:
-            actuator_tx.send_estop_all(actuator_ids, critical=True)
-        except Exception:
-            pass
-
     if serial_link is not None:
         try:
             serial_link.close()
         except Exception:
             pass
 
-    if feed_state.enabled and feed_state.cfg is not None:
+    if feed_state.enabled and feed_state.serial_link is not None:
         try:
-            if feed_state.cfg.disable_on_exit:
-                _feed_send_enable(feed_state, state=False)
+            feed_state.serial_link.close()
         except Exception:
             pass
-        if feed_state.serial_link is not None:
-            try:
-                feed_state.serial_link.close()
-            except Exception:
-                pass
 
     gamepad.close()
 
@@ -1111,7 +1061,6 @@ def run_teleop(
             sample = gamepad.poll()
             _update_forward_state_and_feed(sample, loop_state, ctx, loop_start)
             _handle_disconnect_estop(sample, loop_start, teleop_cfg, loop_state, ctx)
-            _handle_manual_estop_and_reset(sample, loop_start, teleop_cfg, loop_state, ctx)
             _handle_monitor_fault(ctx)
             _sync_monitor_active_state(ctx)
 
@@ -1135,6 +1084,7 @@ def run_teleop(
                 delta_yaw=0.0,
                 delta_pitch=0.0,
                 estop_latched=ctx.sim2real_bridge.estop_latched,
+                motor_target_mm=motor_target_mm,
                 loop_state=loop_state,
                 ctx=ctx,
             )
