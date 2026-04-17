@@ -27,6 +27,7 @@ from control.feed import (
     build_pos_control_frame,
     resolve_feed_config,
     resolve_direction_flag,
+    resolve_step_pulses,
 )
 from control.teleop_common import (
     log_event as _base_log_event,
@@ -463,7 +464,8 @@ def _setup_feed_runtime(
         mode="DRY_RUN" if dry_run else "HARDWARE",
         port=feed_cfg.port,
         addr=feed_cfg.addr,
-        step=feed_cfg.step_pulses,
+        forward_step=feed_cfg.step_pulses,
+        backward_step=feed_cfg.backward_step_pulses,
         repeat_hz=feed_cfg.repeat_hz,
         current=current_pulses,
     )
@@ -499,14 +501,15 @@ def _handle_feed_step_once(ctx: TeleopRuntimeContext, forward: bool) -> str:
         log_event("FEED_REENABLE_OK")
 
     cfg = feed_state.cfg
+    step_pulses = resolve_step_pulses(cfg, forward=forward)
     if not _feed_send_step_once(
         feed_state=feed_state,
-        step_pulses=cfg.step_pulses,
+        step_pulses=step_pulses,
         forward=forward,
     ):
         return "failed"
 
-    delta = int(cfg.step_pulses) if forward else -int(cfg.step_pulses)
+    delta = int(step_pulses) if forward else -int(step_pulses)
     feed_state.current_pulses = int(feed_state.current_pulses) + delta
     return "sent"
 

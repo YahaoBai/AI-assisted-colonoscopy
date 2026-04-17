@@ -20,4 +20,5 @@ eval_reports/
 sim2real_motor_log.csv
 sim2real_motor_plot.png
 .codex
-
+camera_capture/
+rename_images.py

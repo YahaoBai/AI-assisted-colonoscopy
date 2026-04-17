@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -298,7 +297,6 @@ def main() -> int:
                 break
 
             timestamp_sec = time.time()
-            frame_name = f"frame_{frame_idx:06d}"
 
             lumen_center: Optional[Tuple[int, int]] = None
             inference_ms: Optional[float] = None
@@ -316,6 +314,7 @@ def main() -> int:
                 lumen_center=lumen_center,
                 frame_shape=frame.shape,
             )
+            frame_name = f"frame_{frame_idx:06d}"
             overlay_frame = build_overlay_frame(
                 frame_bgr=frame,
                 mask_u8=mask_u8,
@@ -356,6 +355,7 @@ def main() -> int:
                 break
 
             frame_idx += 1
+
     finally:
         csv_file.close()
         cap.release()

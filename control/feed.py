@@ -7,7 +7,7 @@
 
 交互命令:
 - f            前进一次（+step_pulses，相对模式）
-- b            后退一次（-step_pulses，相对模式）
+- b            后退一次（-backward_step_pulses，相对模式）
 - h            打印帮助
 
 CLI 参数:
@@ -63,6 +63,7 @@ class FeedConfig:
     steps_per_rev: int = 200
 
     step_pulses: int = 200
+    backward_step_pulses: Optional[int] = None
     repeat_hz: float = 10.0
     default_vel: int = 100
     default_acc: int = 0
@@ -80,6 +81,10 @@ class FeedConfig:
         self.microstep = int(self.microstep)
         self.steps_per_rev = int(self.steps_per_rev)
         self.step_pulses = int(self.step_pulses)
+        if self.backward_step_pulses is None:
+            self.backward_step_pulses = self.step_pulses
+        else:
+            self.backward_step_pulses = int(self.backward_step_pulses)
         self.repeat_hz = float(self.repeat_hz)
         self.default_vel = int(self.default_vel)
         self.default_acc = int(self.default_acc)
@@ -99,6 +104,8 @@ class FeedConfig:
             raise ValueError("feed.steps_per_rev must be > 0")
         if self.step_pulses <= 0:
             raise ValueError("feed.step_pulses must be > 0")
+        if int(self.backward_step_pulses) <= 0:
+            raise ValueError("feed.backward_step_pulses must be > 0")
         if self.repeat_hz <= 0.0 or self.repeat_hz > 100.0:
             raise ValueError("feed.repeat_hz must be in (0, 100]")
         if not (0 <= self.default_vel <= 0xFFFF):
@@ -198,6 +205,13 @@ def resolve_direction_flag(forward: bool) -> int:
     return 0 if bool(forward) else 1
 
 
+def resolve_step_pulses(cfg: FeedConfig, forward: bool) -> int:
+    """
+    根据方向解析本次应发送的步长。
+    """
+    return int(cfg.step_pulses) if bool(forward) else int(cfg.backward_step_pulses)
+
+
 # -------------------------
 # Config loading
 # -------------------------
@@ -279,6 +293,7 @@ def resolve_feed_config(dry_run: bool, config_path: str = DEFAULT_CONFIG_PATH) -
         microstep=int(feed_raw.get("microstep", 16)),
         steps_per_rev=int(feed_raw.get("steps_per_rev", 200)),
         step_pulses=int(feed_raw.get("step_pulses", 200)),
+        backward_step_pulses=feed_raw.get("backward_step_pulses"),
         repeat_hz=float(feed_raw.get("repeat_hz", 10.0)),
         default_vel=int(feed_raw.get("default_vel", 100)),
         default_acc=int(feed_raw.get("default_acc", 0)),
@@ -382,8 +397,8 @@ def _send_step_once(
 def _print_help() -> None:
     print(
         "\nCommands:\n"
-        "  f            forward one step\n"
-        "  b            backward one step\n"
+        "  f            forward one step (step_pulses)\n"
+        "  b            backward one step (backward_step_pulses)\n"
         "  h            show help\n"
         "  Ctrl+C       exit\n"
     )
@@ -403,14 +418,16 @@ def run_feed(cfg: FeedConfig) -> int:
 
     # 软件侧“相对位移累计计数”（仅日志显示，不做限位拦截）。
     current_pulses = 0
-    step_pulses = int(cfg.step_pulses)
+    forward_step_pulses = int(cfg.step_pulses)
+    backward_step_pulses = int(cfg.backward_step_pulses)
 
     log_event(
         "READY",
         mode="DRY_RUN" if cfg.dry_run else "HARDWARE",
         port=cfg.port,
         addr=cfg.addr,
-        step=step_pulses,
+        forward_step=forward_step_pulses,
+        backward_step=backward_step_pulses,
         current=current_pulses,
     )
 
@@ -432,6 +449,7 @@ def run_feed(cfg: FeedConfig) -> int:
                 continue
 
             if cmd == "f":
+                step_pulses = resolve_step_pulses(cfg, forward=True)
                 if not _send_step_once(
                     serial_link,
                     cfg,
@@ -446,6 +464,7 @@ def run_feed(cfg: FeedConfig) -> int:
                 continue
 
             if cmd == "b":
+                step_pulses = resolve_step_pulses(cfg, forward=False)
                 if not _send_step_once(
                     serial_link,
                     cfg,

@@ -183,6 +183,7 @@ class TeleopCoreTests(unittest.TestCase):
         dry_run: bool = True,
         locked: bool = False,
         repeat_hz: float = 10.0,
+        backward_step_pulses: int | None = None,
     ) -> tr.FeedRuntimeState:
         cfg = FeedConfig(
             port="/dev/ttyUSB1",
@@ -190,6 +191,7 @@ class TeleopCoreTests(unittest.TestCase):
             timeout=0.05,
             addr=1,
             step_pulses=200,
+            backward_step_pulses=backward_step_pulses,
             repeat_hz=repeat_hz,
             default_vel=100,
             default_acc=0,
@@ -545,6 +547,23 @@ class TeleopCoreTests(unittest.TestCase):
         mock_enable.assert_called_once_with(feed_state, state=True)
         mock_send.assert_called_once_with(feed_state=feed_state, step_pulses=200, forward=True)
         self.assertFalse(feed_state.reenable_pending)
+
+    def test_feed_backward_uses_backward_step_pulses(self) -> None:
+        feed_state = self._make_feed_state(
+            teleop_enabled=True,
+            dry_run=True,
+            locked=False,
+            backward_step_pulses=100,
+        )
+        ctx = self._make_ctx(feed_state)
+        with patch(
+            "control.teleop_runtime._feed_send_step_once",
+            return_value=True,
+        ) as mock_send:
+            result = tr._handle_feed_step_once(ctx, forward=False)
+        self.assertEqual(result, "sent")
+        mock_send.assert_called_once_with(feed_state=feed_state, step_pulses=100, forward=False)
+        self.assertEqual(feed_state.current_pulses, -100)
 
     def test_estop_latch_disables_and_locks_feed(self) -> None:
         feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)

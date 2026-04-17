@@ -13,6 +13,7 @@ from control.feed import (
     run_feed,
     resolve_feed_config,
     resolve_direction_flag,
+    resolve_step_pulses,
 )
 
 
@@ -57,6 +58,12 @@ class FeedProtocolTests(unittest.TestCase):
         self.assertEqual(resolve_direction_flag(True), 0)
         self.assertEqual(resolve_direction_flag(False), 1)
 
+    def test_resolve_step_pulses_by_direction(self) -> None:
+        cfg = FeedConfig(step_pulses=50, backward_step_pulses=100)
+        cfg.validate()
+        self.assertEqual(resolve_step_pulses(cfg, forward=True), 50)
+        self.assertEqual(resolve_step_pulses(cfg, forward=False), 100)
+
 
 class FeedConfigTests(unittest.TestCase):
     def _write_yaml(self, yaml_text: str) -> str:
@@ -79,6 +86,7 @@ class FeedConfigTests(unittest.TestCase):
                 microstep: 32
                 steps_per_rev: 200
                 step_pulses: 150
+                backward_step_pulses: 260
                 repeat_hz: 8.5
                 default_vel: 120
                 default_acc: 8
@@ -93,11 +101,17 @@ class FeedConfigTests(unittest.TestCase):
         self.assertEqual(cfg.timeout, 0.2)
         self.assertEqual(cfg.addr, 7)
         self.assertEqual(cfg.step_pulses, 150)
+        self.assertEqual(cfg.backward_step_pulses, 260)
         self.assertAlmostEqual(cfg.repeat_hz, 8.5)
         self.assertEqual(cfg.default_vel, 120)
         self.assertEqual(cfg.default_acc, 8)
         self.assertTrue(cfg.teleop_enabled)
         self.assertTrue(cfg.dry_run)
+
+    def test_feed_config_defaults_backward_step_to_forward_step(self) -> None:
+        cfg = FeedConfig(step_pulses=150, backward_step_pulses=None)
+        cfg.validate()
+        self.assertEqual(cfg.backward_step_pulses, 150)
 
     def test_feed_config_rejects_invalid_repeat_hz(self) -> None:
         with self.assertRaises(ValueError):

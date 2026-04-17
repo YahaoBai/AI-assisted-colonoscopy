@@ -18,7 +18,7 @@ sim2real:
   pitch_limit_deg: 170.0
 
   # 电机绝对位移目标硬限幅（单位 mm，实际限位区间为 [-motor_limit_mm, +motor_limit_mm]）
-  motor_limit_mm: 9.0
+  motor_limit_mm: 10.0
 
   # 串口下发频率（Hz）。仿真可高频运行，bridge 会按该频率节流下发。
   control_hz: 30.0
@@ -149,8 +149,9 @@ sim2real:
   # 说明：这一层只负责“进给滑台”链路，和电缸 yaw/pitch 协议完全分离。
   # =============================================================================
   feed:
-    # 是否在 teleop 中启用滑台联动（默认关闭，避免误触发推进）
-    teleop_enabled: true
+    # 是否在 teleop 中启用滑台联动；当前手柄模式仅控制电缸，因此关闭
+    # true是两个都用 false是只用电缸
+    teleop_enabled: false
 
     # 滑台串口
     port: "/dev/ttyUSB1"
@@ -164,9 +165,11 @@ sim2real:
     microstep: 16
     steps_per_rev: 200
 
-    # 前进一次的默认步长（pulses）3mm/s
+    # 前进一次的默认步长（pulses）
     step_pulses: 50
-    # 手柄按住 Y 的连续发送频率（Hz）
+    # 后退一次的默认步长（pulses）
+    backward_step_pulses: 100
+    # 手柄按住 Y/A 的连续发送频率（Hz）
     repeat_hz: 100.0
     # 位置控制速度/加速度参数
     default_vel: 100
