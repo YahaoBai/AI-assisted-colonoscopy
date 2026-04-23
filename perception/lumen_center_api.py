@@ -5,9 +5,9 @@ import torchvision.transforms as transforms
 import time
 import cv2
 
-MODEL_PATH = './checkpoints/attention_best_model.pth'
+MODEL_PATH = './checkpoints/best_model666.pth'
 IMAGE_SIZE = 256
-THRESHOLD = 0.01  
+THRESHOLD = 0.5  
 GUIDED_RADIUS = 9
 GUIDED_EPS = 0.01
 MORPHOLOGY_KERNEL = 5

@@ -8,14 +8,14 @@ sim2real:
   # bridge 内部会把变化量累加为“电机绝对位移目标(mm)”。
   # 上机前请替换为你的实机标定矩阵。
   J_4x2_mm_per_rad:
-    - [5.0, 0.0]
-    - [0.0, 5.0]
     - [-5.0, 0.0]
     - [0.0, -5.0]
+    - [5.0, 0.0]
+    - [0.0, 5.0]
 
   # 基于“指令累计角”的单轴限位
-  yaw_limit_deg: 170.0
-  pitch_limit_deg: 170.0
+  yaw_limit_deg: 1000
+  pitch_limit_deg: 1000
 
   # 电机绝对位移目标硬限幅（单位 mm，实际限位区间为 [-motor_limit_mm, +motor_limit_mm]）
   motor_limit_mm: 10.0
@@ -143,6 +143,38 @@ sim2real:
     left_stick_x_axis: 0
     left_stick_y_axis: 1
 
+  # =============================================================================
+  # [Layer 5.25] PID 自动驾驶控制器
+  # 说明：这一层定义 PID2 的视觉误差滤波、分段增益和单步姿态输出限幅。
+  # =============================================================================
+  pid:
+    # 中值滤波窗口长度（单位：帧）
+    filter_window: 5
+
+    yaw:
+      kp: 0.05
+      ki: 0.05
+      kd: 0.0
+      output_limit_rad: 2.1
+
+    pitch:
+      kp: 0.05
+      ki: 0.05
+      kd: 0.0
+      output_limit_rad: 2.1
+
+    # |error| 大于该阈值时关闭积分并清空积分项
+    integral_disable_error_abs: 0.15
+    # 大误差区间阈值
+    large_error_abs: 0.2
+    # 近中心区间阈值
+    near_center_error_abs: 0.05
+
+    large_error_kp_scale: 0.7
+    large_error_kd_scale: 1.5
+    near_center_kp_scale: 2.0
+    near_center_kd_scale: 1.0
+
 
   # =============================================================================
   # [Layer 5.5] 进给滑台（Feed Slider, Emm_V5）
@@ -151,7 +183,7 @@ sim2real:
   feed:
     # 是否在 teleop 中启用滑台联动；当前手柄模式仅控制电缸，因此关闭
     # true是两个都用 false是只用电缸
-    teleop_enabled: false
+    teleop_enabled: true
 
     # 滑台串口
     port: "/dev/ttyUSB1"
@@ -166,11 +198,11 @@ sim2real:
     steps_per_rev: 200
 
     # 前进一次的默认步长（pulses）
-    step_pulses: 50
+    step_pulses: 200
     # 后退一次的默认步长（pulses）
     backward_step_pulses: 100
     # 手柄按住 Y/A 的连续发送频率（Hz）
-    repeat_hz: 100.0
+    repeat_hz: 30
     # 位置控制速度/加速度参数
     default_vel: 100
     default_acc: 0

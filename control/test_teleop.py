@@ -1,7 +1,10 @@
+import csv
 import os
+import shutil
 import tempfile
 import textwrap
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -547,6 +550,7 @@ class TeleopCoreTests(unittest.TestCase):
         mock_enable.assert_called_once_with(feed_state, state=True)
         mock_send.assert_called_once_with(feed_state=feed_state, step_pulses=200, forward=True)
         self.assertFalse(feed_state.reenable_pending)
+        self.assertEqual(feed_state.last_delta_pulses, 200)
 
     def test_feed_backward_uses_backward_step_pulses(self) -> None:
         feed_state = self._make_feed_state(
@@ -564,6 +568,7 @@ class TeleopCoreTests(unittest.TestCase):
         self.assertEqual(result, "sent")
         mock_send.assert_called_once_with(feed_state=feed_state, step_pulses=100, forward=False)
         self.assertEqual(feed_state.current_pulses, -100)
+        self.assertEqual(feed_state.last_delta_pulses, -100)
 
     def test_estop_latch_disables_and_locks_feed(self) -> None:
         feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
@@ -688,6 +693,8 @@ class TeleopCoreTests(unittest.TestCase):
         runtime_cfg = self._make_runtime_cfg()
         teleop_cfg = TeleopConfig(allow_feed_without_actuator=True)
         feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
+        capture_root = Path(tempfile.mkdtemp(prefix="teleop_capture_test_"))
+        self.addCleanup(lambda: shutil.rmtree(capture_root, ignore_errors=True))
 
         with patch(
             "control.teleop_runtime.load_dagger_sim2real_runtime_config",
@@ -718,6 +725,9 @@ class TeleopCoreTests(unittest.TestCase):
         ) as mock_bridge_send, patch(
             "control.teleop_runtime._sleep_for_rate",
             return_value=None,
+        ), patch(
+            "control.teleop_runtime.TELEOP_CAPTURE_ROOT",
+            capture_root,
         ):
             rc = tr.run_teleop(
                 config_path="control/sim2real_config.yaml",
@@ -738,6 +748,8 @@ class TeleopCoreTests(unittest.TestCase):
         runtime_cfg = self._make_runtime_cfg()
         teleop_cfg = TeleopConfig(allow_feed_without_actuator=False)
         feed_state = self._make_feed_state(teleop_enabled=True, dry_run=True, locked=False)
+        capture_root = Path(tempfile.mkdtemp(prefix="teleop_capture_test_"))
+        self.addCleanup(lambda: shutil.rmtree(capture_root, ignore_errors=True))
 
         with patch(
             "control.teleop_runtime.load_dagger_sim2real_runtime_config",
@@ -775,6 +787,9 @@ class TeleopCoreTests(unittest.TestCase):
         ) as mock_bridge_send, patch(
             "control.teleop_runtime._sleep_for_rate",
             return_value=None,
+        ), patch(
+            "control.teleop_runtime.TELEOP_CAPTURE_ROOT",
+            capture_root,
         ):
             rc = tr.run_teleop(
                 config_path="control/sim2real_config.yaml",
@@ -790,6 +805,83 @@ class TeleopCoreTests(unittest.TestCase):
         self.assertGreaterEqual(mock_bridge_send.call_count, 1)
         self.assertEqual(mock_setup_feed.call_count, 1)
         self.assertTrue(mock_setup_feed.call_args.kwargs["check_port_conflict"])
+
+    def test_run_teleop_records_controls_csv(self) -> None:
+        runtime_cfg = self._make_runtime_cfg()
+        teleop_cfg = TeleopConfig(
+            invert_yaw=False,
+            invert_pitch=False,
+            allow_feed_without_actuator=False,
+        )
+        feed_state = self._make_feed_state(teleop_enabled=False, dry_run=True, locked=False)
+        capture_root = Path(tempfile.mkdtemp(prefix="teleop_capture_test_"))
+        self.addCleanup(lambda: shutil.rmtree(capture_root, ignore_errors=True))
+
+        with patch(
+            "control.teleop_runtime.load_dagger_sim2real_runtime_config",
+            return_value=runtime_cfg,
+        ), patch(
+            "control.teleop_runtime.load_teleop_config",
+            return_value=teleop_cfg,
+        ), patch(
+            "control.teleop_runtime.PygameGamepadInput",
+            FakeRuntimeGamepad,
+        ), patch(
+            "control.teleop_runtime.Sim2RealBridge",
+            FakeRuntimeBridge,
+        ), patch(
+            "control.teleop_runtime.MotorMapper",
+            FakeMapper,
+        ), patch(
+            "control.teleop_runtime._setup_actuator_io",
+            return_value=(None, None, None),
+        ), patch(
+            "control.teleop_runtime._setup_feed_runtime",
+            return_value=feed_state,
+        ), patch(
+            "control.teleop_runtime._run_boot_reset",
+            return_value=None,
+        ), patch(
+            "control.teleop_runtime._sleep_for_rate",
+            return_value=None,
+        ), patch(
+            "control.teleop_runtime.TELEOP_CAPTURE_ROOT",
+            capture_root,
+        ):
+            rc = tr.run_teleop(
+                config_path="control/sim2real_config.yaml",
+                dry_run=True,
+                debug_input=False,
+                list_controllers_only=False,
+            )
+
+        self.assertEqual(rc, 0)
+        csv_files = list(capture_root.glob("*/controls.csv"))
+        self.assertEqual(len(csv_files), 1)
+
+        with csv_files[0].open("r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        self.assertEqual(
+            list(rows[0].keys()),
+            [
+                "wall_time_sec",
+                "m1_target_mm",
+                "m2_target_mm",
+                "m3_target_mm",
+                "m4_target_mm",
+                "feed_delta_pulses",
+                "estop_latched",
+            ],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(float(rows[0]["m1_target_mm"]), 5.6, places=6)
+        self.assertAlmostEqual(float(rows[0]["m2_target_mm"]), -5.6, places=6)
+        self.assertAlmostEqual(float(rows[0]["m3_target_mm"]), -5.6, places=6)
+        self.assertAlmostEqual(float(rows[0]["m4_target_mm"]), 5.6, places=6)
+        self.assertEqual(int(rows[0]["feed_delta_pulses"]), 0)
+        self.assertEqual(int(rows[0]["estop_latched"]), 0)
+        self.assertGreater(float(rows[0]["wall_time_sec"]), 0.0)
 
     def test_cleanup_runtime_no_estop_and_no_feed_disable(self) -> None:
         class _DummyGamepad:

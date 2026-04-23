@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
@@ -42,6 +44,16 @@ FEED_RESET_ENABLE_SETTLE_SEC = 0.15
 FEED_POST_RESET_PREMOVE_SETTLE_SEC = 0.10
 _ESTOP_LOG_FREEZE = False
 _INPUT_LINE_ACTIVE = False
+TELEOP_CAPTURE_ROOT = Path("teleop_capture")
+TELEOP_CONTROL_FIELDS = (
+    "wall_time_sec",
+    "m1_target_mm",
+    "m2_target_mm",
+    "m3_target_mm",
+    "m4_target_mm",
+    "feed_delta_pulses",
+    "estop_latched",
+)
 
 
 def _set_estop_log_freeze(enabled: bool) -> None:
@@ -107,6 +119,7 @@ class FeedRuntimeState:
     locked: bool
     reenable_pending: bool = False
     next_send_ts: float = 0.0
+    last_delta_pulses: int = 0
 
 
 @dataclass
@@ -151,6 +164,78 @@ class TeleopLoopState:
     last_debug_estop_latched: bool
     last_debug_motor_counts: Optional[Tuple[int, int, int, int]]
     last_motor_limit_active: Tuple[bool, bool, bool, bool]
+
+
+def _resolve_teleop_capture_dir(now_sec: Optional[float] = None) -> Path:
+    timestamp = time.strftime(
+        "%Y%m%d_%H%M%S",
+        time.localtime(time.time() if now_sec is None else float(now_sec)),
+    )
+    return TELEOP_CAPTURE_ROOT / timestamp
+
+
+@dataclass
+class TeleopRecorder:
+    """
+    手柄控制极简原始记录器。
+    """
+
+    output_dir: Path
+    csv_path: Path
+    csv_file: Any
+    writer: csv.DictWriter
+
+    @classmethod
+    def create(cls, output_dir: Optional[Path] = None) -> "TeleopRecorder":
+        resolved_dir = (
+            Path(output_dir).expanduser()
+            if output_dir is not None
+            else _resolve_teleop_capture_dir()
+        )
+        resolved_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = resolved_dir / "controls.csv"
+        csv_file = csv_path.open("w", encoding="utf-8", newline="")
+        writer = csv.DictWriter(csv_file, fieldnames=TELEOP_CONTROL_FIELDS)
+        writer.writeheader()
+        csv_file.flush()
+        return cls(
+            output_dir=resolved_dir,
+            csv_path=csv_path,
+            csv_file=csv_file,
+            writer=writer,
+        )
+
+    def record(
+        self,
+        *,
+        wall_time_sec: float,
+        motor_target_mm: np.ndarray,
+        feed_delta_pulses: int,
+        estop_latched: bool,
+    ) -> None:
+        target_vec = np.asarray(motor_target_mm, dtype=np.float64).reshape(-1)
+        if target_vec.shape != (4,):
+            raise ValueError(f"motor_target_mm must have shape (4,), got {target_vec.shape}")
+
+        self.writer.writerow(
+            {
+                "wall_time_sec": f"{float(wall_time_sec):.6f}",
+                "m1_target_mm": f"{float(target_vec[0]):.8f}",
+                "m2_target_mm": f"{float(target_vec[1]):.8f}",
+                "m3_target_mm": f"{float(target_vec[2]):.8f}",
+                "m4_target_mm": f"{float(target_vec[3]):.8f}",
+                "feed_delta_pulses": int(feed_delta_pulses),
+                "estop_latched": int(bool(estop_latched)),
+            }
+        )
+        self.csv_file.flush()
+
+    def close(self) -> None:
+        self.csv_file.close()
+
+
+def _create_teleop_recorder() -> TeleopRecorder:
+    return TeleopRecorder.create()
 
 
 def send_follow_target_mm(
@@ -486,6 +571,7 @@ def _handle_feed_step_once(ctx: TeleopRuntimeContext, forward: bool) -> str:
         "failed" : 发送失败（仅告警，不触发急停）
     """
     feed_state = ctx.feed_state
+    feed_state.last_delta_pulses = 0
     if not feed_state.enabled or feed_state.cfg is None:
         return "blocked"
     if feed_state.locked or ctx.sim2real_bridge.estop_latched:
@@ -511,6 +597,7 @@ def _handle_feed_step_once(ctx: TeleopRuntimeContext, forward: bool) -> str:
 
     delta = int(step_pulses) if forward else -int(step_pulses)
     feed_state.current_pulses = int(feed_state.current_pulses) + delta
+    feed_state.last_delta_pulses = delta
     return "sent"
 
 
@@ -1021,6 +1108,7 @@ def run_teleop(
     actuator_monitor: Optional[ActuatorMonitor] = None
     serial_link = None
     feed_state = _disabled_feed_state()
+    recorder: Optional[TeleopRecorder] = None
 
     try:
         if not feed_only_mode:
@@ -1052,6 +1140,7 @@ def run_teleop(
             allow_feed_without_actuator=feed_only_mode,
         )
         loop_state = _create_loop_state(control_hz=sim2real_cfg.control_hz)
+        recorder = _create_teleop_recorder()
         if feed_only_mode:
             log_event("BOOT_READY", mode="FEED_ONLY")
         else:
@@ -1059,8 +1148,10 @@ def run_teleop(
 
         while True:
             loop_start = time.monotonic()
+            wall_time_sec = time.time()
             _ = _compute_loop_dt(loop_state, loop_start)
 
+            ctx.feed_state.last_delta_pulses = 0
             sample = gamepad.poll()
             _update_forward_state_and_feed(sample, loop_state, ctx, loop_start)
             _handle_disconnect_estop(sample, loop_start, teleop_cfg, loop_state, ctx)
@@ -1098,10 +1189,19 @@ def run_teleop(
                     loop_state=loop_state,
                     ctx=ctx,
                 )
+            if recorder is not None:
+                recorder.record(
+                    wall_time_sec=wall_time_sec,
+                    motor_target_mm=np.asarray(ctx.sim2real_bridge.motor_target_mm, dtype=np.float64),
+                    feed_delta_pulses=int(ctx.feed_state.last_delta_pulses),
+                    estop_latched=ctx.sim2real_bridge.estop_latched,
+                )
             _sleep_for_rate(loop_start, loop_state.period_sec)
     except KeyboardInterrupt:
         log_event("STOP", reason="KEYBOARD_INTERRUPT")
     finally:
+        if recorder is not None:
+            recorder.close()
         _cleanup_runtime(
             gamepad=gamepad,
             actuator_tx=actuator_tx,

@@ -22,3 +22,13 @@ sim2real_motor_plot.png
 .codex
 camera_capture/
 rename_images.py
+choose1.py
+choose3.py
+teleop_capture/
+plot.py
+plot2.py
+comparison_figures/
+comparison_figures2/
+sim_capture/
+test_plot.py
+test_plot2.py
