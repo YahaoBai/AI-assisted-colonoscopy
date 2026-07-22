@@ -20,6 +20,7 @@ class GamepadSample:
     forward_pressed: bool
     backward_pressed: bool
     connected: bool
+    hold_pressed: bool = False
 
 
 class PygameGamepadInput:
@@ -165,6 +166,7 @@ class PygameGamepadInput:
             # 固定语义：Y=前进，A=后退（不再由 YAML 覆盖）。
             "forward": self._resolve_button_id("north"),
             "backward": self._resolve_button_id("south"),
+            "hold": self._resolve_button_id("east"),
         }
 
     def _resolve_button_id(self, button_name: str) -> int:
@@ -199,6 +201,7 @@ class PygameGamepadInput:
                     forward_pressed=False,
                     backward_pressed=False,
                     connected=False,
+                    hold_pressed=False,
                 )
 
             if self.joystick is not None:
@@ -221,6 +224,7 @@ class PygameGamepadInput:
                     axis_y = 0.0
             forward_pressed = bool(self.controller.get_button(self._button_ids["forward"]))
             backward_pressed = bool(self.controller.get_button(self._button_ids["backward"]))
+            hold_pressed = bool(self.controller.get_button(self._button_ids["hold"]))
         except Exception:
             # 读取异常按断连处理，由上层触发安全动作
             return GamepadSample(
@@ -230,6 +234,7 @@ class PygameGamepadInput:
                 forward_pressed=False,
                 backward_pressed=False,
                 connected=False,
+                hold_pressed=False,
             )
 
         return GamepadSample(
@@ -239,6 +244,7 @@ class PygameGamepadInput:
             forward_pressed=forward_pressed,
             backward_pressed=backward_pressed,
             connected=True,
+            hold_pressed=hold_pressed,
         )
 
     @classmethod

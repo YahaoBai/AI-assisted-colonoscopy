@@ -115,7 +115,7 @@ _light_switch_cooldown = False
 IMG_WIDTH = 256
 IMG_HEIGHT = 256
 
-MANUAL_MOVE_SPEED = 0.6
+MANUAL_MOVE_SPEED = 0.4
 MANUAL_ROTATE_SPEED = 1.8
 ZOOM_SPEED = 10.0
 
@@ -185,7 +185,7 @@ debug_path = "./masks"
 if not os.path.exists(debug_path): os.makedirs(debug_path)
 
 try:
-    if not os.path.exists('./assets/xml/colon_scene.xml'):
+    if not os.path.exists('./assets/xml/colon_scene2.xml'):
         model = mujoco.MjModel.from_xml_string("""
         <mujoco>
           <worldbody>
@@ -197,7 +197,7 @@ try:
         </mujoco>
         """)
     else:
-        model = mujoco.MjModel.from_xml_path('./assets/xml/colon_scene.xml')
+        model = mujoco.MjModel.from_xml_path('./assets/xml/colon_scene2.xml')
 
     data = mujoco.MjData(model)
     renderer = mujoco.Renderer(model, height=IMG_HEIGHT, width=IMG_WIDTH)

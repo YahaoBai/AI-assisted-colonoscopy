@@ -1,3 +1,4 @@
+import csv
 import unittest
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from unittest.mock import patch
@@ -245,6 +246,323 @@ class IL2Tests(unittest.TestCase):
 
         mock_step.assert_called_once()
         np.testing.assert_array_equal(ctx.sim2real_bridge.motor_target_mm, before)
+
+    def test_gamepad_sample_hold_pressed_defaults_false(self) -> None:
+        sample = GamepadSample(
+            timestamp_sec=1.0,
+            axis_x=0.0,
+            axis_y=0.0,
+            forward_pressed=False,
+            backward_pressed=False,
+            connected=True,
+        )
+
+        self.assertFalse(sample.hold_pressed)
+
+    def test_manual_pose_stick_maps_to_direct_motor_target(self) -> None:
+        sample = GamepadSample(
+            timestamp_sec=1.0,
+            axis_x=0.5,
+            axis_y=0.25,
+            forward_pressed=False,
+            backward_pressed=False,
+            connected=True,
+        )
+        state = il2.ManualPoseLoopState()
+        cfg = type("Cfg", (), {"invert_yaw": False, "invert_pitch": False})()
+
+        result = il2.compute_manual_pose_result(
+            sample=sample,
+            teleop_cfg=cfg,
+            motor_limit_mm=10.0,
+            manual_pose_state=state,
+            current_motor_target_mm=np.zeros(4, dtype=np.float64),
+        )
+
+        self.assertEqual(result.command, "MANUAL_CMD")
+        np.testing.assert_allclose(
+            result.motor_target_mm,
+            np.asarray([5.0, 2.5, -5.0, -2.5], dtype=np.float64),
+        )
+        self.assertFalse(result.hold_active)
+
+    def test_manual_pose_stick_center_returns_target_to_zero(self) -> None:
+        sample = GamepadSample(
+            timestamp_sec=1.0,
+            axis_x=0.0,
+            axis_y=0.0,
+            forward_pressed=False,
+            backward_pressed=False,
+            connected=True,
+        )
+        state = il2.ManualPoseLoopState()
+        cfg = type("Cfg", (), {"invert_yaw": False, "invert_pitch": False})()
+
+        result = il2.compute_manual_pose_result(
+            sample=sample,
+            teleop_cfg=cfg,
+            motor_limit_mm=10.0,
+            manual_pose_state=state,
+            current_motor_target_mm=np.asarray([4.0, -3.0, -4.0, 3.0], dtype=np.float64),
+        )
+
+        np.testing.assert_allclose(result.motor_target_mm, np.zeros(4, dtype=np.float64))
+
+    def test_manual_pose_b_toggles_hold_and_ignores_stick_until_unlocked(self) -> None:
+        cfg = type("Cfg", (), {"invert_yaw": False, "invert_pitch": False})()
+        state = il2.ManualPoseLoopState()
+        locked_target = np.asarray([3.0, 4.0, -3.0, -4.0], dtype=np.float64)
+
+        lock_sample = GamepadSample(
+            timestamp_sec=1.0,
+            axis_x=0.0,
+            axis_y=0.0,
+            forward_pressed=False,
+            backward_pressed=False,
+            connected=True,
+            hold_pressed=True,
+        )
+        lock_result = il2.compute_manual_pose_result(
+            sample=lock_sample,
+            teleop_cfg=cfg,
+            motor_limit_mm=10.0,
+            manual_pose_state=state,
+            current_motor_target_mm=locked_target,
+        )
+
+        self.assertEqual(lock_result.command, "MANUAL_HOLD")
+        np.testing.assert_allclose(lock_result.motor_target_mm, locked_target)
+        self.assertTrue(state.hold_active)
+
+        moved_stick_sample = GamepadSample(
+            timestamp_sec=1.1,
+            axis_x=-1.0,
+            axis_y=1.0,
+            forward_pressed=False,
+            backward_pressed=False,
+            connected=True,
+            hold_pressed=False,
+        )
+        held_result = il2.compute_manual_pose_result(
+            sample=moved_stick_sample,
+            teleop_cfg=cfg,
+            motor_limit_mm=10.0,
+            manual_pose_state=state,
+            current_motor_target_mm=np.asarray([9.0, 9.0, -9.0, -9.0], dtype=np.float64),
+        )
+
+        self.assertEqual(held_result.command, "MANUAL_HOLD")
+        np.testing.assert_allclose(held_result.motor_target_mm, locked_target)
+
+        unlock_sample = GamepadSample(
+            timestamp_sec=1.2,
+            axis_x=-1.0,
+            axis_y=1.0,
+            forward_pressed=False,
+            backward_pressed=False,
+            connected=True,
+            hold_pressed=True,
+        )
+        unlocked_result = il2.compute_manual_pose_result(
+            sample=unlock_sample,
+            teleop_cfg=cfg,
+            motor_limit_mm=10.0,
+            manual_pose_state=state,
+            current_motor_target_mm=locked_target,
+        )
+
+        self.assertEqual(unlocked_result.command, "MANUAL_CMD")
+        np.testing.assert_allclose(
+            unlocked_result.motor_target_mm,
+            np.asarray([-10.0, 10.0, 10.0, -10.0], dtype=np.float64),
+        )
+        self.assertFalse(state.hold_active)
+
+    def test_clearing_manual_hold_for_autopilot_keeps_current_bridge_target(self) -> None:
+        state = il2.ManualPoseLoopState(
+            hold_active=True,
+            hold_pressed_prev=True,
+            hold_target_mm=np.asarray([2.0, 3.0, -2.0, -3.0], dtype=np.float64),
+        )
+        bridge_target = np.asarray([2.0, 3.0, -2.0, -3.0], dtype=np.float64)
+
+        il2.clear_manual_pose_hold(state, current_hold_pressed=False)
+
+        self.assertFalse(state.hold_active)
+        np.testing.assert_allclose(bridge_target, np.asarray([2.0, 3.0, -2.0, -3.0], dtype=np.float64))
+
+    def test_send_manual_pose_target_clamps_to_motor_limit_without_hardware(self) -> None:
+        yaml_path = self._write_yaml(
+            build_yaml_text(
+                J_rows="    - [5.0, 0.0]\n    - [0.0, 5.0]\n    - [-5.0, 0.0]\n    - [0.0, -5.0]",
+                motor_limit_mm=10.0,
+            )
+        )
+        control = il2.load_yaml_bound_control(yaml_path)
+        feed_state = FeedRuntimeState(
+            enabled=False,
+            cfg=None,
+            serial_link=None,
+            current_pulses=0,
+            locked=False,
+            next_send_ts=0.0,
+        )
+        ctx = TeleopRuntimeContext(
+            sim2real_bridge=control.sim2real_bridge,
+            motor_mapper=control.motor_mapper,
+            actuator_ids=control.actuator_ids,
+            actuator_tx=None,
+            actuator_monitor=None,
+            monitor_settle_sec=0.1,
+            feed_state=feed_state,
+            dry_run=True,
+            allow_feed_without_actuator=False,
+        )
+        state = il2.ManualPoseLoopState()
+
+        ok = il2.send_manual_pose_target_mm(
+            control=control,
+            ctx=ctx,
+            manual_pose_state=state,
+            motor_target_mm=np.asarray([20.0, -20.0, -20.0, 20.0], dtype=np.float64),
+            motor_limit_active=(True, True, True, True),
+            actuator_tx=None,
+        )
+
+        self.assertTrue(ok)
+        np.testing.assert_allclose(
+            ctx.sim2real_bridge.motor_target_mm,
+            np.asarray([10.0, -10.0, -10.0, 10.0], dtype=np.float64),
+        )
+
+    def test_estop_latched_blocks_manual_pose_target_update(self) -> None:
+        yaml_path = self._write_yaml(
+            build_yaml_text(
+                J_rows="    - [5.0, 0.0]\n    - [0.0, 5.0]\n    - [-5.0, 0.0]\n    - [0.0, -5.0]"
+            )
+        )
+        control = il2.load_yaml_bound_control(yaml_path)
+        control.sim2real_bridge.estop_latched = True
+        control.sim2real_bridge.motor_target_mm = np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+        feed_state = FeedRuntimeState(
+            enabled=False,
+            cfg=None,
+            serial_link=None,
+            current_pulses=0,
+            locked=False,
+            next_send_ts=0.0,
+        )
+        ctx = TeleopRuntimeContext(
+            sim2real_bridge=control.sim2real_bridge,
+            motor_mapper=control.motor_mapper,
+            actuator_ids=control.actuator_ids,
+            actuator_tx=None,
+            actuator_monitor=None,
+            monitor_settle_sec=0.1,
+            feed_state=feed_state,
+            dry_run=True,
+            allow_feed_without_actuator=False,
+        )
+
+        ok = il2.send_manual_pose_target_mm(
+            control=control,
+            ctx=ctx,
+            manual_pose_state=il2.ManualPoseLoopState(),
+            motor_target_mm=np.zeros(4, dtype=np.float64),
+            motor_limit_active=(False, False, False, False),
+            actuator_tx=None,
+        )
+
+        self.assertTrue(ok)
+        np.testing.assert_allclose(
+            ctx.sim2real_bridge.motor_target_mm,
+            np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float64),
+        )
+
+    def test_write_metric_row_includes_manual_pose_fields(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            recorder = il2.SessionRecorder.create(tmpdir)
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            sample = GamepadSample(
+                timestamp_sec=1.0,
+                axis_x=0.0,
+                axis_y=0.0,
+                forward_pressed=False,
+                backward_pressed=False,
+                connected=True,
+                hold_pressed=True,
+            )
+
+            il2.write_metric_row(
+                recorder,
+                frame_idx=5,
+                timestamp_sec=123.0,
+                frame_bgr=frame,
+                scope_center=(320, 240),
+                lumen_center=(321, 242),
+                error_x_px=1,
+                error_y_px=2,
+                error_norm_px=float(np.hypot(1, 2)),
+                inference_ms=8.5,
+                status_text="OK",
+                control_mode="MANUAL_HOLD",
+                autopilot_on=False,
+                policy_step_yaw=0.0,
+                policy_step_pitch=0.0,
+                bridge_command="MANUAL_HOLD",
+                estop_latched=False,
+                sample=sample,
+                feed_delta_pulses=0,
+                motor_target_mm=np.asarray([1.0, 2.0, -1.0, -2.0], dtype=np.float64),
+                manual_hold_active=True,
+            )
+            recorder.close()
+
+            with (il2.Path(tmpdir) / "frame_metrics.csv").open("r", encoding="utf-8", newline="") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        self.assertEqual(rows[0]["control_mode"], "MANUAL_HOLD")
+        self.assertEqual(rows[0]["hold_pressed"], "1")
+        self.assertEqual(rows[0]["manual_hold_active"], "1")
+
+    def test_session_recorder_starts_only_when_autopilot_recording_begins(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            recorder, started = il2.maybe_start_session_recorder(
+                None,
+                output_dir=tmpdir,
+                save_session_artifacts=True,
+            )
+            self.assertTrue(started)
+            self.assertIsNotNone(recorder)
+            assert recorder is not None
+            self.assertTrue((il2.Path(tmpdir) / "frame_metrics.csv").exists())
+
+            same_recorder, started_again = il2.maybe_start_session_recorder(
+                recorder,
+                output_dir=tmpdir,
+                save_session_artifacts=True,
+            )
+            self.assertFalse(started_again)
+            self.assertIs(same_recorder, recorder)
+            recorder.close()
+
+        disabled_recorder, disabled_started = il2.maybe_start_session_recorder(
+            None,
+            output_dir="",
+            save_session_artifacts=False,
+        )
+        self.assertFalse(disabled_started)
+        self.assertIsNone(disabled_recorder)
+
+    def test_should_record_frame_requires_autopilot_and_recorder(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            recorder = il2.SessionRecorder.create(tmpdir)
+            try:
+                self.assertFalse(il2.should_record_frame(False, recorder))
+                self.assertFalse(il2.should_record_frame(True, None))
+                self.assertTrue(il2.should_record_frame(True, recorder))
+            finally:
+                recorder.close()
 
     def test_classify_exception_reason_detects_ram_and_cuda_oom(self) -> None:
         self.assertEqual(

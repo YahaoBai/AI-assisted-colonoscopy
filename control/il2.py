@@ -14,7 +14,7 @@ import subprocess
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
@@ -61,6 +61,7 @@ from control.teleop_runtime import (
     FeedRuntimeState,
     TeleopRuntimeContext,
     _cleanup_runtime,
+    _compute_direct_motor_target_mm,
     _feed_send_enable,
     _handle_feed_step_once,
     _setup_actuator_io,
@@ -94,6 +95,7 @@ CSV_FIELDNAMES = [
     "error_norm_px",
     "inference_ms",
     "status",
+    "control_mode",
     "autopilot_on",
     "policy_step_yaw",
     "policy_step_pitch",
@@ -101,6 +103,8 @@ CSV_FIELDNAMES = [
     "estop_latched",
     "forward_pressed",
     "backward_pressed",
+    "hold_pressed",
+    "manual_hold_active",
     "feed_delta_pulses",
     "m1_target_mm",
     "m2_target_mm",
@@ -399,6 +403,29 @@ class FeedButtonLoopState:
 
 
 @dataclass
+class ManualPoseLoopState:
+    hold_active: bool = False
+    hold_pressed_prev: bool = False
+    hold_target_mm: np.ndarray = field(
+        default_factory=lambda: np.zeros(4, dtype=np.float64)
+    )
+    last_motor_limit_active: Tuple[bool, bool, bool, bool] = (
+        False,
+        False,
+        False,
+        False,
+    )
+
+
+@dataclass
+class ManualPoseResult:
+    command: str
+    motor_target_mm: np.ndarray
+    motor_limit_active: Tuple[bool, bool, bool, bool]
+    hold_active: bool
+
+
+@dataclass
 class SessionRecorder:
     output_root: Path
     raw_dir: Path
@@ -502,6 +529,23 @@ def resolve_output_root(output_dir: str) -> Path:
     return DEFAULT_OUTPUT_ROOT / timestamp
 
 
+def maybe_start_session_recorder(
+    recorder: Optional[SessionRecorder],
+    *,
+    output_dir: str,
+    save_session_artifacts: bool,
+) -> tuple[Optional[SessionRecorder], bool]:
+    if recorder is not None:
+        return recorder, False
+    if not save_session_artifacts:
+        return None, False
+    return SessionRecorder.create(output_dir), True
+
+
+def should_record_frame(autopilot_on: bool, recorder: Optional[SessionRecorder]) -> bool:
+    return bool(autopilot_on and recorder is not None)
+
+
 def load_yaml_bound_control(
     config_path: str | Path = SIM2REAL_CONFIG_PATH,
 ) -> IL2YamlBoundControl:
@@ -533,6 +577,129 @@ def map_motor_target_to_counts(
     motor_target_mm: np.ndarray,
 ) -> np.ndarray:
     return control.motor_mapper.mm_targets_to_counts(motor_target_mm)
+
+
+def sample_hold_pressed(sample: GamepadSample) -> bool:
+    return bool(getattr(sample, "hold_pressed", False))
+
+
+def control_mode_text(autopilot_on: bool, manual_pose_state: ManualPoseLoopState) -> str:
+    if autopilot_on:
+        return "AUTO"
+    if manual_pose_state.hold_active:
+        return "MANUAL_HOLD"
+    return "MANUAL"
+
+
+def clear_manual_pose_hold(
+    manual_pose_state: ManualPoseLoopState,
+    *,
+    current_hold_pressed: bool = False,
+) -> None:
+    manual_pose_state.hold_active = False
+    manual_pose_state.hold_pressed_prev = bool(current_hold_pressed)
+    manual_pose_state.hold_target_mm = np.zeros(4, dtype=np.float64)
+    manual_pose_state.last_motor_limit_active = (False, False, False, False)
+
+
+def compute_manual_pose_result(
+    *,
+    sample: GamepadSample,
+    teleop_cfg: Any,
+    motor_limit_mm: float,
+    manual_pose_state: ManualPoseLoopState,
+    current_motor_target_mm: np.ndarray,
+) -> ManualPoseResult:
+    hold_now = sample_hold_pressed(sample)
+    hold_edge = hold_now and (not manual_pose_state.hold_pressed_prev)
+    manual_pose_state.hold_pressed_prev = hold_now
+
+    current_target = np.asarray(current_motor_target_mm, dtype=np.float64).reshape(4)
+    if hold_edge:
+        if manual_pose_state.hold_active:
+            manual_pose_state.hold_active = False
+            manual_pose_state.hold_target_mm = np.zeros(4, dtype=np.float64)
+        else:
+            manual_pose_state.hold_active = True
+            manual_pose_state.hold_target_mm = current_target.copy()
+
+    if manual_pose_state.hold_active:
+        limit_mm = max(0.0, float(motor_limit_mm))
+        target = np.clip(
+            np.asarray(manual_pose_state.hold_target_mm, dtype=np.float64).reshape(4),
+            -limit_mm,
+            limit_mm,
+        )
+        active = tuple(
+            bool(abs(float(v)) >= (limit_mm - 1e-9)) for v in target.tolist()
+        )
+        manual_pose_state.hold_target_mm = target.copy()
+        return ManualPoseResult(
+            command="MANUAL_HOLD",
+            motor_target_mm=target,
+            motor_limit_active=active,
+            hold_active=True,
+        )
+
+    _, _, motor_target_mm, motor_limit_active = _compute_direct_motor_target_mm(
+        sample=sample,
+        teleop_cfg=teleop_cfg,
+        motor_limit_mm=float(motor_limit_mm),
+    )
+    return ManualPoseResult(
+        command="MANUAL_CMD",
+        motor_target_mm=np.asarray(motor_target_mm, dtype=np.float64),
+        motor_limit_active=tuple(bool(x) for x in motor_limit_active),
+        hold_active=False,
+    )
+
+
+def send_manual_pose_target_mm(
+    *,
+    control: IL2YamlBoundControl,
+    ctx: TeleopRuntimeContext,
+    manual_pose_state: ManualPoseLoopState,
+    motor_target_mm: np.ndarray,
+    motor_limit_active: Tuple[bool, bool, bool, bool],
+    actuator_tx: Optional[ActuatorTx],
+) -> bool:
+    if ctx.sim2real_bridge.estop_latched:
+        return True
+
+    target = np.asarray(motor_target_mm, dtype=np.float64).reshape(4)
+    limit_mm = float(ctx.sim2real_bridge.motor_limit_mm)
+    target = np.clip(target, -limit_mm, limit_mm)
+
+    prev_active = np.asarray(manual_pose_state.last_motor_limit_active, dtype=bool)
+    current_active = np.asarray(motor_limit_active, dtype=bool)
+    new_hits = current_active & (~prev_active)
+    if np.any(new_hits):
+        motor_names = ("m1", "m2", "m3", "m4")
+        hit_text = ",".join(
+            name for name, is_hit in zip(motor_names, new_hits.tolist()) if is_hit
+        )
+        print(f">>> [IL2] MANUAL_MOTOR_LIMIT_HIT limit_mm={limit_mm:.3f} motors={hit_text}")
+    manual_pose_state.last_motor_limit_active = tuple(
+        bool(x) for x in current_active.tolist()
+    )
+
+    ctx.sim2real_bridge.motor_target_mm = target.copy()
+    ctx.sim2real_bridge.motor_limit_active = current_active.copy()
+
+    if ctx.dry_run:
+        return True
+    if actuator_tx is None:
+        print("⚠️ [IL2] actuator_tx 未就绪，无法发送手动姿态目标。")
+        return False
+
+    return send_follow_target_mm(
+        target,
+        motor_mapper=control.motor_mapper,
+        actuator_tx=actuator_tx,
+        actuator_ids=control.actuator_ids,
+        frame_name="F3_FOLLOW",
+        critical=False,
+    )
 
 
 def compute_center_error(
@@ -593,6 +760,7 @@ def build_overlay_frame(
     policy_step_yaw: float,
     policy_step_pitch: float,
     feed_delta_pulses: int,
+    manual_hold_active: bool = False,
 ) -> np.ndarray:
     display = np.asarray(frame_bgr, dtype=np.uint8).copy()
     mask_bool = mask_u8 > 0
@@ -614,7 +782,7 @@ def build_overlay_frame(
         cv2.circle(display, lumen_center, 6, (0, 0, 255), thickness=2)
         cv2.line(display, scope_center, lumen_center, (0, 255, 255), thickness=1)
 
-    state_text = "AUTO" if autopilot_on else "MANUAL"
+    state_text = "AUTO" if autopilot_on else ("MANUAL-HOLD" if manual_hold_active else "MANUAL")
     if estop_latched:
         state_text += " | ESTOP"
 
@@ -622,6 +790,7 @@ def build_overlay_frame(
         f"state: {state_text}",
         f"status: {status_text}",
         f"policy dyaw={policy_step_yaw:.5f} dpitch={policy_step_pitch:.5f}",
+        f"manual hold={int(bool(manual_hold_active))}",
         f"feed delta={int(feed_delta_pulses)} pulses",
         "inference: n/a" if inference_ms is None else f"inference: {inference_ms:.2f} ms",
     ]
@@ -662,6 +831,8 @@ def write_metric_row(
     sample: GamepadSample,
     feed_delta_pulses: int,
     motor_target_mm: np.ndarray,
+    manual_hold_active: bool = False,
+    control_mode: str = "MANUAL",
 ) -> None:
     target_vec = np.asarray(motor_target_mm, dtype=np.float64).reshape(-1)
     recorder.writer.writerow(
@@ -679,6 +850,7 @@ def write_metric_row(
             "error_norm_px": "" if error_norm_px is None else f"{float(error_norm_px):.6f}",
             "inference_ms": "" if inference_ms is None else f"{float(inference_ms):.6f}",
             "status": status_text,
+            "control_mode": str(control_mode),
             "autopilot_on": int(bool(autopilot_on)),
             "policy_step_yaw": f"{float(policy_step_yaw):.8f}",
             "policy_step_pitch": f"{float(policy_step_pitch):.8f}",
@@ -686,6 +858,8 @@ def write_metric_row(
             "estop_latched": int(bool(estop_latched)),
             "forward_pressed": int(bool(sample.forward_pressed)),
             "backward_pressed": int(bool(sample.backward_pressed)),
+            "hold_pressed": int(sample_hold_pressed(sample)),
+            "manual_hold_active": int(bool(manual_hold_active)),
             "feed_delta_pulses": int(feed_delta_pulses),
             "m1_target_mm": f"{float(target_vec[0]):.8f}",
             "m2_target_mm": f"{float(target_vec[1]):.8f}",
@@ -951,18 +1125,21 @@ def main() -> int:
             return 1
 
         if SAVE_SESSION_ARTIFACTS:
-            recorder = SessionRecorder.create(OUTPUT_DIR)
-            print(f">>> [IL2] 运行结果目录: {recorder.output_root}")
+            print(">>> [IL2] 数据记录将在按 5 开启自动驾驶后开始。")
+        else:
+            print(">>> [IL2] SAVE_SESSION_ARTIFACTS=False，跳过图像与 frame_metrics.csv 保存。")
 
         frame_buffer = prefill_policy_buffer(cap)
         autopilot_on = False
         frame_idx = 0
+        record_frame_idx = 0
         read_failures = 0
         loop_period_sec = 1.0 / float(control.runtime_cfg.bridge.control_hz)
         last_loop_ts = time.monotonic()
         feed_loop_state = FeedButtonLoopState()
+        manual_pose_state = ManualPoseLoopState()
 
-        print(">>> [IL2] 启动完成。按 5 切换自动驾驶，按 q 退出。")
+        print(">>> [IL2] 启动完成。左摇杆手动控制姿态，B 锁定/解锁姿态；按 5 开启自动驾驶并开始记录，按 q 退出。")
 
         while True:
             loop_start = time.monotonic()
@@ -1026,6 +1203,50 @@ def main() -> int:
             last_loop_state["status"] = status_text
             last_loop_state["bridge_command"] = bridge_command
 
+            if autopilot_on:
+                clear_manual_pose_hold(
+                    manual_pose_state,
+                    current_hold_pressed=sample_hold_pressed(sample),
+                )
+            elif not ctx.sim2real_bridge.estop_latched:
+                manual_result = compute_manual_pose_result(
+                    sample=sample,
+                    teleop_cfg=teleop_cfg,
+                    motor_limit_mm=ctx.sim2real_bridge.motor_limit_mm,
+                    manual_pose_state=manual_pose_state,
+                    current_motor_target_mm=ctx.sim2real_bridge.motor_target_mm,
+                )
+                bridge_command = manual_result.command
+                last_loop_state["bridge_command"] = bridge_command
+                send_ok = send_manual_pose_target_mm(
+                    control=control,
+                    ctx=ctx,
+                    manual_pose_state=manual_pose_state,
+                    motor_target_mm=manual_result.motor_target_mm,
+                    motor_limit_active=manual_result.motor_limit_active,
+                    actuator_tx=actuator_tx,
+                )
+                if not send_ok:
+                    exit_reason = "SERIAL_TX_FAIL"
+                    last_loop_state["autopilot_on"] = False
+                    latch_estop(ctx, "SERIAL_TX_FAIL")
+                    break
+                follow_tx_log_count += 1
+                if (follow_tx_log_count % FOLLOW_TX_LOG_EVERY_N) == 0:
+                    target_counts = map_motor_target_to_counts(
+                        control,
+                        np.asarray(ctx.sim2real_bridge.motor_target_mm, dtype=np.float64),
+                    )
+                    count_text = " ".join(
+                        f"{motor}(id={aid})={count}"
+                        for motor, aid, count in zip(
+                            control.runtime_cfg.bridge.motor_order,
+                            control.actuator_ids,
+                            target_counts.tolist(),
+                        )
+                    )
+                    print(f"[IL2 TX] F3_FOLLOW seq={follow_tx_log_count} | {count_text}")
+
             if autopilot_on and (not ctx.sim2real_bridge.estop_latched):
                 if center_coords is not None:
                     try:
@@ -1086,7 +1307,7 @@ def main() -> int:
                                 )
                             )
                             print(f"[IL2 TX] F3_FOLLOW seq={follow_tx_log_count} | {count_text}")
-                        motor_recorder.record(frame_idx, bridge_result.motor_target_mm)
+                        motor_recorder.record(record_frame_idx, bridge_result.motor_target_mm)
                 else:
                     bridge_command = "NO_LUMEN_HOLD"
                     last_loop_state["bridge_command"] = bridge_command
@@ -1096,6 +1317,7 @@ def main() -> int:
                 frame.shape,
             )
             motor_target_mm = np.asarray(ctx.sim2real_bridge.motor_target_mm, dtype=np.float64)
+            control_mode = control_mode_text(autopilot_on, manual_pose_state)
             overlay_frame = build_overlay_frame(
                 frame_bgr=frame,
                 mask_u8=mask_u8,
@@ -1108,13 +1330,16 @@ def main() -> int:
                 policy_step_yaw=policy_step_yaw,
                 policy_step_pitch=policy_step_pitch,
                 feed_delta_pulses=int(ctx.feed_state.last_delta_pulses),
+                manual_hold_active=manual_pose_state.hold_active,
             )
 
-            if recorder is not None:
-                save_frame_artifacts(recorder, frame_idx, frame, mask_u8, overlay_frame)
+            recording_active = bool(autopilot_on)
+            if should_record_frame(autopilot_on, recorder):
+                assert recorder is not None
+                save_frame_artifacts(recorder, record_frame_idx, frame, mask_u8, overlay_frame)
                 write_metric_row(
                     recorder,
-                    frame_idx=frame_idx,
+                    frame_idx=record_frame_idx,
                     timestamp_sec=wall_time_sec,
                     frame_bgr=frame,
                     scope_center=scope_center,
@@ -1124,6 +1349,7 @@ def main() -> int:
                     error_norm_px=error_norm_px,
                     inference_ms=inference_ms,
                     status_text=status_text,
+                    control_mode=control_mode,
                     autopilot_on=autopilot_on,
                     policy_step_yaw=policy_step_yaw,
                     policy_step_pitch=policy_step_pitch,
@@ -1132,7 +1358,10 @@ def main() -> int:
                     sample=sample,
                     feed_delta_pulses=int(ctx.feed_state.last_delta_pulses),
                     motor_target_mm=motor_target_mm,
+                    manual_hold_active=manual_pose_state.hold_active,
                 )
+            if recording_active:
+                record_frame_idx += 1
 
             cv2.imshow(WINDOW_NAME, overlay_frame)
             key = cv2.waitKey(1) & 0xFF
@@ -1140,10 +1369,27 @@ def main() -> int:
                 if ctx.sim2real_bridge.estop_latched:
                     print(">>> [IL2] ESTOP 已锁存，自动驾驶不可开启。")
                 else:
+                    was_autopilot_on = bool(autopilot_on)
                     autopilot_on = not autopilot_on
+                    clear_manual_pose_hold(
+                        manual_pose_state,
+                        current_hold_pressed=sample_hold_pressed(sample),
+                    )
                     last_loop_state["autopilot_on"] = bool(autopilot_on)
                     state_text = "开启" if autopilot_on else "关闭"
                     print(f">>> [IL2] 自动驾驶已{state_text}")
+                    if autopilot_on and not was_autopilot_on:
+                        recorder, recorder_started = maybe_start_session_recorder(
+                            recorder,
+                            output_dir=OUTPUT_DIR,
+                            save_session_artifacts=SAVE_SESSION_ARTIFACTS,
+                        )
+                        if recorder_started and recorder is not None:
+                            print(f">>> [IL2] 自动驾驶数据记录开始: {recorder.output_root}")
+                        elif recorder is not None:
+                            print(f">>> [IL2] 自动驾驶数据记录继续: {recorder.output_root}")
+                        else:
+                            print(">>> [IL2] 自动驾驶已开启；当前未保存图像与 frame_metrics.csv。")
             elif key == ord("q"):
                 exit_reason = "USER_QUIT"
                 print(">>> [IL2] 收到退出指令。")

@@ -289,6 +289,35 @@ class TeleopCoreTests(unittest.TestCase):
         self.assertAlmostEqual(PygameGamepadInput._normalize_axis_value(32767), 1.0, places=4)
         self.assertAlmostEqual(PygameGamepadInput._normalize_axis_value(-32768), -1.0, places=7)
 
+    def test_input_poll_reads_east_button_as_hold_pressed(self) -> None:
+        class FakeController:
+            def get_attached(self):
+                return True
+
+            def get_axis(self, axis):
+                _ = axis
+                return 0.0
+
+            def get_button(self, button_id):
+                return int(button_id) == 2
+
+        gamepad = PygameGamepadInput(TeleopConfig())
+        gamepad.pygame = SimpleNamespace(event=SimpleNamespace(pump=lambda: None))
+        gamepad.controller = FakeController()
+        gamepad.joystick = None
+        gamepad._axes_armed = True
+        gamepad._button_ids = {
+            "forward": 0,
+            "backward": 1,
+            "hold": 2,
+        }
+
+        sample = gamepad.poll()
+
+        self.assertFalse(sample.forward_pressed)
+        self.assertFalse(sample.backward_pressed)
+        self.assertTrue(sample.hold_pressed)
+
     def test_disconnect_timeout_estop(self) -> None:
         self.assertTrue(
             should_trigger_disconnect_estop(
